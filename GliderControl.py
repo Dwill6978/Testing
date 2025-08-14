@@ -4,6 +4,7 @@ import csv
 import pygame
 import argparse
 import numpy as np
+from scipy.optimize import curve_fit
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
@@ -13,11 +14,23 @@ from cflib.crazyflie.syncLogger import SyncLogger
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from collections import deque
+import array as arr
 
 # Constants
 uri = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 max = 65535
 tolerance = 0.05
+
+#Tail Deflection Data
+global m2_pwm
+m2_pwm = np.array([0, 15000, 23000 ,25000 ,32767 ,45000, 50000 ,55000 ,65535])
+global m2_angle
+m2_angle = np.array([-40, -12, -3, 0, 4 , 12, 14, 15, 20])
+
+global m3_pwm
+m3_pwm = np.array([0, 15000, 32767, 40000, 45000, 55000, 63000])
+global m3_angle
+m3_angle = np.array([-40, -20, -7, 0, 9, 21, 40])
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR)
@@ -64,10 +77,10 @@ ax2.legend()
 
 line_motor2, = ax3.plot([], [], label="Motor M2 Power", color="cyan")
 line_motor3, = ax3.plot([], [], label="Motor M3 Power", color="magenta")
-ax3.set_ylim(0, max)  # Adjust y-axis range based on expected values
+ax3.set_ylim(-45,45)  # Adjust y-axis range based on expected values
 ax3.set_title("Live Motor Power Data")
 ax3.set_xlabel("Time (seconds)")
-ax3.set_ylabel("Motor Power (0-65535)")
+ax3.set_ylabel("CS Deflection Angle (degrees)")
 ax3.legend()
 
 line_pm, = ax4.plot([], [], label="Battery Level", color="lime")
@@ -76,6 +89,12 @@ ax4.set_title("Live Battery Level")
 ax4.set_xlabel("Time (seconds)")
 ax4.set_ylabel("Battery Level (%)")
 ax4.legend()
+
+def quadratic(x,a,b,c):
+    """
+    Quadratic function for curve fitting.
+    """
+    return a*x**2 + b*x + c
 
 def round_to_nearest(value, step):
     """
@@ -166,6 +185,14 @@ def update_plot(frame):
 def main():
     global cf
 
+    #Calculate PWM to Angle Curve Fit
+    params2, covariance = curve_fit(quadratic, m2_pwm, m2_angle)
+    a2, b2, c2 = params2
+
+    params3, covariance3 = curve_fit(quadratic, m3_pwm, m3_angle)
+    a3, b3, c3 = params3
+
+
     filename = input("Enter the filename to save data (without extension): ")
     filename = filename + ".csv"
     with open(filename, 'w', newline='') as csvfile:
@@ -206,7 +233,8 @@ def main():
             motor_m3 = float(data['motor.m3'])
             battery_level = float(data['pm.batteryLevel'])  # Battery Charge Level
             timestamp = timestamp / 1000.0  # Convert to seconds for better readability
-
+            motor_m2 = quadratic(motor_m2, a2, b2, c2)#Convert to Angle of Deflection
+            motor_m3 = quadratic(motor_m3, a3, b3, c3)#Convert to Angle of Deflection
             # Append data to the deque for live graphing
             motor2_data.append(motor_m2)
             motor3_data.append(motor_m3)
