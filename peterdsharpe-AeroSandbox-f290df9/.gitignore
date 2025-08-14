@@ -1,0 +1,14 @@
+dist/
+AeroSandbox.egg-info/
+.idea/
+__pycache__/
+*.pkl
+*.asw
+.pytest_cache/
+.spyrpoject/
+*.DS_Store
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+~*.*
+docs/build
+*.vspscript

@@ -1,0 +1,10 @@
+theme: jekyll-theme-cayman
+
+title: <img src="media/images/asb-logo-light.png" alt="AeroSandbox Logo" width="600px">
+description: Aircraft design optimization made fast through modern automatic differentiation. Plug-and-play analysis tools for aerodynamics, propulsion, structures, trajectory design, and much more.
+google_analytics:
+show_downloads: true
+
+github:
+  zip_url: https://github.com/peterdsharpe/aerosandbox/zipball/master
+  tar_url: https://github.com/peterdsharpe/aerosandbox/tarball/master
