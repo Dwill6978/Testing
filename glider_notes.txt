@@ -1,0 +1,33 @@
+test
+
+KP 300,300,300
+
+Sabilized well, some right wind that wasnt able to overcome. A couple test logs. Ailerons bigger, double wall thickness near nose, better hatch, connection was issue as well as controller recoginization. Write failsafes on firmwarre side. Did not breakpoint logs. Tray?
+
+8/13 - 2 flights with 300 p PID then 250 pid 11:20ish 3/4 flights
+11:30ish 1 flight
+11:35ish
+
+8/14: 3pm P/R P:150 I:0, Y (:300, I:0
+
+F2 cut p by 0.5
+
+F3 P to 200
+
+F4 P to 100
+
+F5 P to 150 roll right * too difficult
+
+F6 redo P to 150 no roll
+
+F7 P to 175
+
+F8 P at 175 again
+
+F9 same as 8
+
+F10 same but at higher launch angle
+
+F11 sending a roll right at 3 degrees per s
+
+F12 same but 70 deg/s

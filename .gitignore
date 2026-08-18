@@ -1,0 +1,13 @@
+# Python bytecode / caches
+__pycache__/
+*.pyc
+
+# Flight data and tool outputs (kept local; synced to OneDrive separately)
+/logs/
+/clipped/
+/cache/
+# Top-level data CSVs only (NOT the vendored AeroSandbox library's CSVs)
+/*.csv
+
+# OS / editor cruft
+.DS_Store

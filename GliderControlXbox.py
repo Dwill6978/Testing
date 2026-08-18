@@ -405,43 +405,43 @@ def main():
 
                             pygame.event.pump()
 
-                            x = joystick.get_axis(0) #Roll
+                            x = joystick.get_axis(3) #Roll
                             x = round(x, 4)
 
-                            y = joystick.get_axis(1) #Pitch
+                            y = joystick.get_axis(4) #Pitch
                             y = round(y, 4)
 
-                            twist = joystick.get_axis(2) #Yaw
+                            twist = joystick.get_axis(0) #Yaw
                             twist = round(twist, 2)
 
-                            throttle = joystick.get_axis(3) #Throttle  
-                            throttle = (throttle+1)/2 
+                            throttle = joystick.get_axis(2) #Throttle  
+                            throttle = (throttle+1)/2
                             throttle = round(throttle, 2)
 
                             if joystick.get_button(0) == 1:  # Trim Button
                                 trimmed = True
-                            if joystick.get_button(1) == 1:  # Untrim Button
+                            if joystick.get_button(3) == 1:  # Untrim Button
                                 trimmed = False
-                            if joystick.get_button(2) == 1:  # DAQ Breakpoint Button
+                            if joystick.get_button(8) == 1:  # DAQ Breakpoint Button
                                 controller_writer.writerow('Break')
                                 motor_writer.writerow('Break')
                                 accelerometer_writer.writerow('Break')
                                 connection_writer.writerow('Break')
-                            if joystick.get_button(3) == 1:  # Arm Motor Button
+                            if joystick.get_button(4) == 1:  # Arm Motor Button
                                 motor = True
                                 cf.param.set_value('servo.servoAngle', 11000)
                             if joystick.get_button(5) == 1:  # Disarm Motor Button  
                                 motor = False
                                 lastVal = setBLMotor(0,lastVal)
-                            if joystick.get_button(6) == 1: # Autonomous Mode Enable Button
+                            if joystick.get_button(2) == 1: # Autonomous Mode Enable Button
                                 autnomous = True
                                 cf.param.set_value('motorPowerSet.enable', '0')
                                 time.sleep(0.01)
-                            if joystick.get_button(7) == 1: # Autonomous Mode Disable Button
+                            if joystick.get_button(1) == 1: # Autonomous Mode Disable Button
                                 autnomous = False
                                 cf.param.set_value('motorPowerSet.enable', '0')
                                 time.sleep(0.01)
-                            if joystick.get_button(10) ==1: # PID Tuning Button
+                            if joystick.get_button(9) ==1: # PID Tuning Button
                                 tempKP = input("Enter new Pitch KP value: ")
                                 tempKI = input("Enter new Pitch KI value: ")
                                 tempKD = input("Enter new Pitch KD value: ")
@@ -470,7 +470,7 @@ def main():
                                     #setMotor(y,4)
                                     #setMotor(x,3)
                                     #setMotor(twist,1)
-                                    Commander.send_setpoint(x,-y,-twist,10001)
+                                    Commander.send_setpoint(x*10,-y*5,-twist*5,10001)
                                 if motor:
                                     lastVal = setBLMotor(throttle,lastVal)
                             
