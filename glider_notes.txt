@@ -31,3 +31,6 @@ F10 same but at higher launch angle
 F11 sending a roll right at 3 degrees per s
 
 F12 same but 70 deg/s
+
+8/21 
+f1 p 170 r 100 y 300
