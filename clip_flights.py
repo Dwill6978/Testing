@@ -16,16 +16,17 @@ acc_x jolts with the flight in between. Detection uses only the accelerometer:
      multi-sample "ringing" of one throw is grouped into a single impulse event via
      SPIKE_CLUSTER_S, whose SIGN is taken from its largest-magnitude sample. A
      flight OPENS at a launch impulse.
-  2. LANDING = the airframe abruptly going still, confirmed by an opposite-
-     direction decel. A hard landing decelerates the airframe (an acc_x jolt in the
-     direction opposite the throw) right before it comes to rest and sits waiting to
-     be recovered. So the flight CLOSES at the first REST_MIN_S stretch of near-
-     constant acc_z (std < REST_STD) after the launch -- provided a >= LAND_SPIKE
-     opposite-direction decel occurred between the launch and that stillness. On the
-     ground acc_z is rock-steady at ~1 g (std ~0.001); in flight it wanders far
-     more, so the abrupt drop to steady readings cleanly marks touchdown and pins an
-     accurate duration. Landing decels are softer/more variable than throws (real
-     logs show ~2 g), hence LAND_SPIKE < ACC_X_SPIKE.
+  2. LANDING = the airframe abruptly going still. The flight CLOSES at the first
+     REST_MIN_S stretch of near-constant acc_z (std < REST_STD) after the launch --
+     the aircraft down and waiting to be recovered. On the ground acc_z is
+     rock-steady at ~1 g (std ~0.001); in flight it wanders far more, so the abrupt
+     drop to steady readings cleanly marks touchdown and pins an accurate duration.
+     The launch..landing span is accepted as a flight if it was confirmed EITHER by
+     a >= LAND_SPIKE opposite-direction decel (a hard landing brakes the airframe
+     with an acc_x jolt opposite the throw; real logs show ~2 g, hence
+     LAND_SPIKE < ACC_X_SPIKE) OR by being clearly airborne (acc_z std over the span
+     >= AIRBORNE_STD). The airborne branch catches soft/belly landings whose decel
+     is too gentle to reach LAND_SPIKE but which were unmistakably in the air.
   3. The next launch is the first strong impulse AFTER that landing, so several
      separate throws in one session become several distinct flights, and a
      mid-flight bump (not followed by rest) never splits one glide. A launch that
@@ -77,6 +78,15 @@ LAND_SPIKE = 1.5    # g, min opposite-direction |acc_x| decel to confirm a landi
 # as the aircraft banks/pitches. Spans with acc_z std below this were never
 # airborne -> dropped.
 Z_CONST_STD = 0.02  # g, minimum acc_z std over a span for it to count as flight
+
+# A flight is confirmed by EITHER a hard opposite-direction landing decel
+# (>= LAND_SPIKE, below) OR a clearly-airborne span. This is the airborne test: a
+# span whose acc_z std exceeds this was unmistakably in the air (real flights show
+# 0.4-1.6 g here; ground is ~0.001 g), so it counts as a flight even when the
+# landing was too soft to produce a LAND_SPIKE decel (a belly/grass landing). Set
+# well above ground/handling noise but below the softest real flight so soft
+# landings are caught without false-triggering on bench handling.
+AIRBORNE_STD = 0.30  # g, acc_z std above which a span counts as airborne on its own
 
 # The landing is pinned by the airframe going still right after touchdown (sitting
 # on the ground awaiting recovery). "Still" = acc_z std below REST_STD (the same
@@ -338,10 +348,18 @@ def _detect_windows(samples: List[Sample]) -> List[Tuple[float, float]]:
         if b is None:
             continue                # never came to rest: incomplete glide, skip
         launch_ok_from = b          # impulses before the landing aren't new launches
-        # Confirm a real landing: a hard opposite-direction decel before touchdown.
-        if _opposite_decel(samples, a, b, sign) < LAND_SPIKE:
+        if b - a < MIN_FLIGHT_S:
             continue
-        if b - a >= MIN_FLIGHT_S and _zstd(samples, a, b) >= Z_CONST_STD:
+        # Confirm a real flight by EITHER a hard opposite-direction decel at
+        # touchdown (a firm landing) OR a clearly-airborne span (acc_z varying far
+        # more than the near-constant ground reading). The airborne branch rescues
+        # soft/belly landings whose decel stays below LAND_SPIKE but which were
+        # plainly in the air. The final Z_CONST_STD gate still rejects a constant-Z
+        # span reached only via a hard decel (never actually airborne).
+        zst = _zstd(samples, a, b)
+        hard_landing = _opposite_decel(samples, a, b, sign) >= LAND_SPIKE
+        airborne = zst >= AIRBORNE_STD
+        if (hard_landing or airborne) and zst >= Z_CONST_STD:
             windows.append((a - EDGE_PAD_S, b + EDGE_PAD_S))
     return windows
 

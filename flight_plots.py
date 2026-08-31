@@ -68,6 +68,19 @@ DERIVED_STYLE = {
     "land": ("#7f7f7f", "land"),
 }
 
+# Events logged as "# BREAKPOINT" markers rather than typed Events.csv rows. In
+# Events.csv these land as `host,BREAKPOINT,<label>,,` so the real name is in the
+# label column (row[2]), not the kind column (row[1]). Manual-override and
+# autonomous-mode toggles are recorded this way; map the labels of interest here.
+# (FLIGHT_START_MOTOR_ARM / FLIGHT_END_MOTOR_DISARM are deliberately omitted: they
+# duplicate the typed MOTOR_ARM / MOTOR_DISARM events already drawn via MAJOR_EVENTS.)
+BREAKPOINT_EVENTS = {
+    "MANUAL_OVERRIDE_ON":  ("#e377c2", "man ovr on"),
+    "MANUAL_OVERRIDE_OFF": ("#bcbd22", "man ovr off"),
+    "AUTONOMOUS_ENABLED":  ("#17becf", "auto on"),
+    "AUTONOMOUS_DISABLED": ("#9edae5", "auto off"),
+}
+
 
 @dataclass
 class FlightData:
@@ -87,6 +100,9 @@ class FlightData:
     throttle: List[float] = field(default_factory=list)
     # Events: list of (cf_time, kind, colour, label)
     events: List[Tuple[float, str, str, str]] = field(default_factory=list)
+    # Detected flight windows (cf_time) to shade on a full-session plot so you can
+    # see where each clip was cut from. Empty for single (clipped/raw) flights.
+    clip_windows: List[Tuple[float, float]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,7 +214,12 @@ def _load_events(fd: FlightData, prefix: str) -> None:
         if len(row) < 2:
             continue
         kind = row[1]
-        if kind not in MAJOR_EVENTS:
+        if kind in MAJOR_EVENTS:
+            disp_kind, (colour, label) = kind, MAJOR_EVENTS[kind]
+        elif kind == "BREAKPOINT" and len(row) >= 3 and row[2] in BREAKPOINT_EVENTS:
+            # Manual-override / autonomous toggles carry their real name in row[2].
+            disp_kind, (colour, label) = row[2], BREAKPOINT_EVENTS[row[2]]
+        else:
             continue
         h = cf._parse_host(row[0])
         if h is None:
@@ -206,8 +227,7 @@ def _load_events(fd: FlightData, prefix: str) -> None:
         t = _host_to_cf(anchors, h)
         if t is None or not _in_window(t, fd.window):
             continue
-        colour, label = MAJOR_EVENTS[kind]
-        fd.events.append((t, kind, colour, label))
+        fd.events.append((t, disp_kind, colour, label))
     fd.events.sort(key=lambda e: e[0])
 
 
@@ -251,9 +271,26 @@ def _add_derived_events(fd: FlightData) -> None:
     fd.events.sort(key=lambda e: e[0])
 
 
+def _add_window_markers(fd: FlightData, windows: List[Tuple[float, float]]) -> None:
+    """Full-session variant of _add_derived_events: mark takeoff+landing for EVERY
+    detected flight window, not just the first. Each detected window is
+    (launch - EDGE_PAD_S, touchdown + EDGE_PAD_S), so the launch/touchdown times are
+    recovered by peeling that pad back off -- keeping the markers exactly consistent
+    with where clip_flights cut each clip. The windows are also stashed on fd so
+    build_figure can shade them."""
+    fd.clip_windows = list(windows)
+    ct, tlbl = DERIVED_STYLE["takeoff"]
+    cl, llbl = DERIVED_STYLE["land"]
+    for lo, hi in windows:
+        fd.events.append((lo + cf.EDGE_PAD_S, "takeoff", ct, tlbl))
+        fd.events.append((hi - cf.EDGE_PAD_S, "land", cl, llbl))
+    fd.events.sort(key=lambda e: e[0])
+
+
 def load_flight(prefix: str, name: Optional[str] = None,
                 window: Optional[Tuple[float, float]] = None,
-                detect_window: bool = False) -> FlightData:
+                detect_window: bool = False,
+                mark_all_windows: bool = False) -> FlightData:
     """Load one flight's streams into a FlightData.
 
     ``prefix`` is the path prefix shared by the stream files (no ``_Stream.csv``).
@@ -261,6 +298,10 @@ def load_flight(prefix: str, name: Optional[str] = None,
     auto-detected from the fused activity signal (for raw, unclipped sessions).
     Already-clipped ``*_flightN_*`` prefixes need neither -- they contain only the
     flight rows -- so pass ``detect_window=False`` (the default).
+
+    ``mark_all_windows`` is for plotting a whole unclipped session: instead of one
+    derived takeoff/landing, mark every detected flight and record the windows so
+    build_figure can shade where each clip was cut from.
     """
     if window is None and detect_window:
         windows = cf._detect_windows(cf._build_activity(prefix))
@@ -270,7 +311,10 @@ def load_flight(prefix: str, name: Optional[str] = None,
     _load_accel(fd, prefix)
     _load_motor(fd, prefix)
     _load_events(fd, prefix)
-    _add_derived_events(fd)
+    if mark_all_windows:
+        _add_window_markers(fd, cf._detect_windows(cf._build_activity(prefix)))
+    else:
+        _add_derived_events(fd)
     return fd
 
 
@@ -281,6 +325,19 @@ def _t0(fd: FlightData) -> float:
     """Earliest sample time, used to zero the x-axis so it reads seconds-into-flight."""
     cands = [s[0] for s in (fd.gyro_t, fd.acc_t, fd.mot_t) if s]
     return min(cands) if cands else 0.0
+
+
+def _draw_clip_windows(ax, fd: FlightData, t0: float, label: bool) -> None:
+    """Shade each detected flight window so a full-session plot shows exactly where
+    every clip was cut from (empty for single clipped/raw flights)."""
+    for i, (lo, hi) in enumerate(fd.clip_windows, 1):
+        ax.axvspan(lo - t0, hi - t0, color="#1f77b4", alpha=0.07, zorder=0)
+        if label:
+            ax.annotate(f"f{i}", xy=((lo + hi) / 2 - t0, 0.0),
+                        xycoords=("data", "axes fraction"),
+                        xytext=(0, 2), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=7, color="#1f77b4",
+                        alpha=0.8)
 
 
 def _draw_events(ax, fd: FlightData, t0: float, label: bool) -> None:
@@ -342,6 +399,12 @@ def build_figure(fd: FlightData, figsize=(11, 8)) -> Figure:
     ax3.set_xlabel("time in flight (s)")
     ax3.legend(fontsize=6, ncol=4, loc="upper right")
     ax3.grid(True, alpha=0.3)
+
+    # Shade detected clip windows behind the traces (full-session plot only);
+    # label f1, f2, ... once on the bottom row.
+    _draw_clip_windows(ax1, fd, t0, label=False)
+    _draw_clip_windows(ax2, fd, t0, label=False)
+    _draw_clip_windows(ax3, fd, t0, label=True)
 
     # Event lines across all rows; label only on the top row.
     _draw_events(ax1, fd, t0, label=True)
@@ -416,7 +479,8 @@ def enumerate_flights(directory: str, match: Optional[str] = None,
 
 def load_flight_ref(ref: FlightRef) -> FlightData:
     return load_flight(ref.prefix, name=ref.name, window=ref.window,
-                       detect_window=ref.detect_window)
+                       detect_window=ref.detect_window,
+                       mark_all_windows=(ref.source == "full"))
 
 
 def session_start_time(prefix: str) -> float:
