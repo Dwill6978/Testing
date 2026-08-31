@@ -25,6 +25,7 @@ Dependencies: PySide6 (or PyQt5), matplotlib, pygame, cflib.
 
 import csv
 import glob
+import json
 import os
 import queue
 import re
@@ -35,7 +36,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -160,6 +161,10 @@ PID_TERM_COL = {"kp": 1, "ki": 2, "kd": 3}
 # Persistent notes: loaded into the Notes tab on launch, written back on close
 # (and on demand via the Save button). Kept next to this script.
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_notes.txt")
+# Persistent PID rate gains: written by the Control tab's "Save as launch
+# defaults" button and reloaded into the spin boxes on every launch, so a tuned
+# set carries over between sessions (and is pushed to the deck on Connect).
+PID_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_pid_defaults.json")
 # Root folder that holds all flight logs. Each session's CSV/Console files are
 # written into a per-day subfolder (YYYYMMDD) so logs stay grouped by flight day.
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -224,6 +229,42 @@ class PidGains:
     pitch: PidAxisGains = field(default_factory=lambda: PidAxisGains(kp=300.0, ki=12.0, kd=0.0, kff=0.0))
     yaw: PidAxisGains = field(default_factory=lambda: PidAxisGains(kp=300.0, ki=12.0, kd=0.0, kff=0.0))
     roll: PidAxisGains = field(default_factory=lambda: PidAxisGains(kp=300.0, ki=12.0, kd=0.0, kff=0.0))
+
+
+PID_AXES = ("pitch", "yaw", "roll")
+PID_TERMS = ("kp", "ki", "kd", "kff")
+
+
+def load_default_gains() -> PidGains:
+    """Launch-time gains: the last set saved from the Control tab, falling back
+    to the PidGains defaults for anything missing or unreadable."""
+    gains = PidGains()
+    try:
+        with open(PID_DEFAULTS_FILE, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return gains
+    except (OSError, ValueError):
+        return gains
+    for axis in PID_AXES:
+        stored = saved.get(axis)
+        if not isinstance(stored, dict):
+            continue
+        g = getattr(gains, axis)
+        for term in PID_TERMS:
+            if term in stored:
+                try:
+                    setattr(g, term, float(stored[term]))
+                except (TypeError, ValueError):
+                    pass
+    return gains
+
+
+def save_default_gains(gains: PidGains) -> None:
+    """Persist these gains as the launch defaults (raises OSError on failure)."""
+    payload = {axis: asdict(getattr(gains, axis)) for axis in PID_AXES}
+    with open(PID_DEFAULTS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -1062,11 +1103,12 @@ class GliderWorker(QtCore.QObject):
         self.cf.param.set_value("pid_rate.roll_ki", gains.roll.ki)
         self.cf.param.set_value("pid_rate.roll_kd", gains.roll.kd)
         self.cf.param.set_value("pid_rate.roll_kff", gains.roll.kff)
+        # Terms are labelled so a log stays readable next to older sessions,
+        # which recorded a bare (kp,ki,kd) triple and no feed-forward term.
         self.logs.write_event(
             "PID_APPLIED",
-            f"pitch({gains.pitch.kp},{gains.pitch.ki},{gains.pitch.kd})",
-            f"yaw({gains.yaw.kp},{gains.yaw.ki},{gains.yaw.kd})",
-            f"roll({gains.roll.kp},{gains.roll.ki},{gains.roll.kd})",
+            *(f"{axis}(kp={g.kp},ki={g.ki},kd={g.kd},kff={g.kff})"
+              for axis, g in ((a, getattr(gains, a)) for a in PID_AXES)),
         )
         self._log("PID gains applied.\n")
 
@@ -2164,7 +2206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(QtWidgets.QLabel("KI"), 0, 2)
         grid.addWidget(QtWidgets.QLabel("KD"), 0, 3)
         grid.addWidget(QtWidgets.QLabel("KFF"), 0, 4)
-        defaults = PidGains()
+        defaults = load_default_gains()
         self.pid_spins = {}
         for row, (axis, g) in enumerate((("pitch", defaults.pitch), ("yaw", defaults.yaw), ("roll", defaults.roll)), start=1):
             grid.addWidget(QtWidgets.QLabel(axis.capitalize()), row, 0)
@@ -2176,6 +2218,12 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_pid_btn = QtWidgets.QPushButton("Apply PID")
         apply_pid_btn.clicked.connect(self._apply_pid)
         grid.addWidget(apply_pid_btn, 4, 0, 1, 5)
+        save_pid_btn = QtWidgets.QPushButton("Save as launch defaults")
+        save_pid_btn.setToolTip("Store these gains in glider_pid_defaults.json so they "
+                                "load into these boxes on the next launch and are pushed "
+                                "to the deck on Connect.")
+        save_pid_btn.clicked.connect(self._save_pid_defaults)
+        grid.addWidget(save_pid_btn, 5, 0, 1, 5)
         layout.addWidget(pid_box)
 
         # Per-surface servo trims: the center each control surface actuates
@@ -2968,13 +3016,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- GUI actions ----------------------------------------------------- #
     def _collect_config(self) -> SessionConfig:
-        gains = PidGains()
-        for axis in ("pitch", "yaw", "roll"):
-            g = getattr(gains, axis)
-            g.kp = self.pid_spins[(axis, 1)].value()
-            g.ki = self.pid_spins[(axis, 2)].value()
-            g.kd = self.pid_spins[(axis, 3)].value()
-            g.kff = self.pid_spins[(axis, 4)].value()
+        gains = self._gains_from_spins()
         return SessionConfig(
             uri=self.uri_edit.text().strip() or DEFAULT_URI,
             filename_prefix=self.filename_edit.text(),
@@ -3030,15 +3072,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.post("event", ("AUTONOMOUS_SETPOINTS",
                                    self.sp_roll.value(), self.sp_pitch.value(), self.sp_yaw.value()))
 
-    def _apply_pid(self) -> None:
+    def _gains_from_spins(self) -> PidGains:
+        """Read the Control-tab PID grid into a PidGains (columns 1..4 = kp/ki/kd/kff)."""
         gains = PidGains()
-        for axis in ("pitch", "yaw", "roll"):
+        for axis in PID_AXES:
             g = getattr(gains, axis)
-            g.kp = self.pid_spins[(axis, 1)].value()
-            g.ki = self.pid_spins[(axis, 2)].value()
-            g.kd = self.pid_spins[(axis, 3)].value()
-            g.kff = self.pid_spins[(axis, 4)].value()
-        self.worker.post("apply_pid", gains)
+            for col, term in enumerate(PID_TERMS, start=1):
+                setattr(g, term, self.pid_spins[(axis, col)].value())
+        return gains
+
+    def _apply_pid(self) -> None:
+        self.worker.post("apply_pid", self._gains_from_spins())
+
+    def _save_pid_defaults(self) -> None:
+        """Persist the current grid as the launch defaults. Does not push to the
+        deck -- use Apply PID for that; this only changes what loads next time."""
+        gains = self._gains_from_spins()
+        try:
+            save_default_gains(gains)
+        except OSError as exc:
+            self._append_console(f"[pid] could not save {PID_DEFAULTS_FILE}: {exc}\n")
+            return
+        self._append_console(f"[pid] saved launch defaults to {PID_DEFAULTS_FILE}\n")
 
     def _zero_override(self) -> None:
         for slider in self.override_sliders.values():
