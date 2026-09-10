@@ -165,6 +165,10 @@ NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_no
 # defaults" button and reloaded into the spin boxes on every launch, so a tuned
 # set carries over between sessions (and is pushed to the deck on Connect).
 PID_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_pid_defaults.json")
+# Persistent Setup-tab settings (log rates/enables, LPF, rate limits, URI, ...).
+# Written by "Save as launch defaults" on that tab, reloaded into the widgets at
+# startup. Keyed by SessionConfig field name -- see MainWindow._setup_bindings.
+SETUP_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_setup_defaults.json")
 # Root folder that holds all flight logs. Each session's CSV/Console files are
 # written into a per-day subfolder (YYYYMMDD) so logs stay grouped by flight day.
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -2043,6 +2047,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_timer.timeout.connect(self.canvas.refresh)
         self.plot_timer.start(50)
 
+        # After every tab exists: a malformed settings file reports to the
+        # Console pane, which must already be built for that to be survivable.
+        self._load_setup_defaults()
+
         self._set_connected_ui(False)
 
     # ----- tab builders ---------------------------------------------------- #
@@ -2134,11 +2142,114 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_window_spin.setValue(DEFAULT_PLOT_WINDOW_S)
         form.addRow("Live plot window:", self.plot_window_spin)
 
+        self.save_setup_btn = QtWidgets.QPushButton("Save settings as launch defaults")
+        self.save_setup_btn.setToolTip(
+            "Store every field on this tab in glider_setup_defaults.json so it is "
+            "restored the next time the GUI starts.")
+        self.save_setup_btn.clicked.connect(self._save_setup_defaults)
+        form.addRow(self.save_setup_btn)
+
         self.connect_btn = QtWidgets.QPushButton("Connect")
         self.connect_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         self.connect_btn.clicked.connect(self._toggle_connection)
         form.addRow(self.connect_btn)
         return w
+
+    def _setup_bindings(self) -> Dict[str, QtWidgets.QWidget]:
+        """SessionConfig field name -> the Setup-tab widget holding that value.
+
+        Single source of truth for the tab. Collecting a SessionConfig, saving
+        and restoring launch defaults, and locking the tab while connected all
+        iterate this map, so a new Setup setting only has to be registered in
+        one place (plus its widget's construction) to be picked up everywhere."""
+        return {
+            "uri": self.uri_edit,
+            "filename_prefix": self.filename_edit,
+            "use_controller": self.controller_chk,
+            "controller_type": self.controller_type_combo,
+            "debug_controller_log": self.controller_debug_chk,
+            "fwactlpf_enable": self.lpf_enable_chk,
+            "fwactlpf_cutoff_hz": self.lpf_cutoff_spin,
+            "roll_rate_limit": self.roll_limit_spin,
+            "pitch_rate_limit": self.pitch_limit_spin,
+            "yaw_rate_limit": self.yaw_limit_spin,
+            "log_controller": self.log_controller_chk,
+            "log_motor": self.log_motor_chk,
+            "log_connection": self.log_connection_chk,
+            "log_accelerometer": self.log_accel_chk,
+            "period_controller_ms": self.period_controller_spin,
+            "period_motor_ms": self.period_motor_spin,
+            "period_connection_ms": self.period_connection_spin,
+            "period_accelerometer_ms": self.period_accel_spin,
+            "plot_window_s": self.plot_window_spin,
+        }
+
+    @staticmethod
+    def _widget_value(wdg: QtWidgets.QWidget) -> object:
+        """Read a Setup widget generically. Combos report their userData (the
+        stable key like "xbox"), not the display label, so saved files survive
+        a wording change in the dropdown."""
+        if isinstance(wdg, QtWidgets.QCheckBox):
+            return wdg.isChecked()
+        if isinstance(wdg, QtWidgets.QComboBox):
+            return wdg.currentData()
+        if isinstance(wdg, QtWidgets.QLineEdit):
+            return wdg.text()
+        return wdg.value()
+
+    @staticmethod
+    def _set_widget_value(wdg: QtWidgets.QWidget, value: object) -> None:
+        """Write a Setup widget generically, coercing to the type Qt demands.
+        JSON has no int/float distinction, so a period saved as 50 comes back as
+        50 but 50.0 would too -- QSpinBox.setValue rejects a float, hence the
+        explicit int()/float() split. An unknown combo key is left alone rather
+        than snapping the selection to index 0."""
+        if isinstance(wdg, QtWidgets.QCheckBox):
+            wdg.setChecked(bool(value))
+        elif isinstance(wdg, QtWidgets.QComboBox):
+            idx = wdg.findData(value)
+            if idx >= 0:
+                wdg.setCurrentIndex(idx)
+        elif isinstance(wdg, QtWidgets.QLineEdit):
+            wdg.setText(str(value))
+        elif isinstance(wdg, QtWidgets.QSpinBox):
+            wdg.setValue(int(value))
+        else:
+            wdg.setValue(float(value))
+
+    def _save_setup_defaults(self) -> None:
+        """Persist every Setup-tab control as the launch defaults."""
+        payload = {field: self._widget_value(wdg)
+                   for field, wdg in self._setup_bindings().items()}
+        try:
+            with open(SETUP_DEFAULTS_FILE, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except OSError as exc:
+            self._append_console(f"[setup] could not save {SETUP_DEFAULTS_FILE}: {exc}\n")
+            return
+        self._append_console(f"[setup] saved launch defaults to {SETUP_DEFAULTS_FILE}\n")
+
+    def _load_setup_defaults(self) -> None:
+        """Restore saved Setup-tab values at startup. Anything missing, unknown
+        or malformed is skipped field by field, so a hand-edited or outdated
+        file degrades to the built-in defaults instead of failing to launch."""
+        try:
+            with open(SETUP_DEFAULTS_FILE, "r", encoding="utf-8") as fh:
+                saved = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            self._append_console(f"[setup] could not load {SETUP_DEFAULTS_FILE}: {exc}\n")
+            return
+        if not isinstance(saved, dict):
+            return
+        for field, wdg in self._setup_bindings().items():
+            if field not in saved:
+                continue
+            try:
+                self._set_widget_value(wdg, saved[field])
+            except (TypeError, ValueError):
+                self._append_console(f"[setup] ignoring bad saved value for {field}\n")
 
     def _rate_spin(self, value: float) -> QtWidgets.QDoubleSpinBox:
         s = QtWidgets.QDoubleSpinBox()
@@ -3016,29 +3127,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- GUI actions ----------------------------------------------------- #
     def _collect_config(self) -> SessionConfig:
-        gains = self._gains_from_spins()
-        return SessionConfig(
-            uri=self.uri_edit.text().strip() or DEFAULT_URI,
-            filename_prefix=self.filename_edit.text(),
-            use_controller=self.controller_chk.isChecked(),
-            controller_type=self.controller_type_combo.currentData(),
-            debug_controller_log=self.controller_debug_chk.isChecked(),
-            fwactlpf_enable=self.lpf_enable_chk.isChecked(),
-            fwactlpf_cutoff_hz=self.lpf_cutoff_spin.value(),
-            roll_rate_limit=self.roll_limit_spin.value(),
-            pitch_rate_limit=self.pitch_limit_spin.value(),
-            yaw_rate_limit=self.yaw_limit_spin.value(),
-            log_controller=self.log_controller_chk.isChecked(),
-            log_motor=self.log_motor_chk.isChecked(),
-            log_connection=self.log_connection_chk.isChecked(),
-            log_accelerometer=self.log_accel_chk.isChecked(),
-            period_controller_ms=self.period_controller_spin.value(),
-            period_motor_ms=self.period_motor_spin.value(),
-            period_connection_ms=self.period_connection_spin.value(),
-            period_accelerometer_ms=self.period_accel_spin.value(),
-            plot_window_s=self.plot_window_spin.value(),
-            gains=gains,
-        )
+        values = {field: self._widget_value(wdg)
+                  for field, wdg in self._setup_bindings().items()}
+        # Only field needing massaging: a blank/whitespace URI means "default".
+        values["uri"] = str(values["uri"]).strip() or DEFAULT_URI
+        return SessionConfig(gains=self._gains_from_spins(), **values)
 
     def _toggle_connection(self) -> None:
         if self.connect_btn.text() == "Connect":
@@ -3183,16 +3276,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_connected_ui(ok)
 
     def _set_connected_ui(self, ok: bool) -> None:
-        # Setup fields locked while connected.
-        for wdg in (self.uri_edit, self.filename_edit, self.controller_chk,
-                    self.controller_type_combo, self.controller_debug_chk,
-                    self.lpf_enable_chk, self.lpf_cutoff_spin,
-                    self.roll_limit_spin, self.pitch_limit_spin, self.yaw_limit_spin,
-                    self.log_controller_chk, self.log_motor_chk,
-                    self.log_connection_chk, self.log_accel_chk,
-                    self.period_controller_spin, self.period_motor_spin,
-                    self.period_connection_spin, self.period_accel_spin,
-                    self.plot_window_spin):
+        # Setup fields locked while connected (the Save-defaults button stays
+        # live, so a session's settings can still be blessed after connecting).
+        for wdg in self._setup_bindings().values():
             wdg.setEnabled(not ok)
         for wdg in (self.arm_btn, self.disarm_btn, self.bp_btn,
                     self.reconnect_btn,
