@@ -1066,8 +1066,21 @@ class GliderWorker(QtCore.QObject):
 
         self.cf.param.set_value("fwActLpf.enable", "1" if self.config.fwactlpf_enable else "0")
         self.cf.param.set_value("fwActLpf.cutoffHz", max(0.1, self.config.fwactlpf_cutoff_hz))
-        self.logs.write_event("FW_ACT_LPF", f"enable={int(self.config.fwactlpf_enable)}",
-                              f"cutoffHz={self.config.fwactlpf_cutoff_hz}")
+        # Read back rather than trusting the write: fwActLpf.* are PARAM_PERSISTENT,
+        # so a failed set leaves the previously stored value in place and the filter
+        # silently stays on. When the filter state is the variable under test, the
+        # log must record what the deck reports, not what the GUI asked for.
+        try:
+            lpf_on = int(float(self.cf.param.get_value("fwActLpf.enable")))
+            lpf_hz = float(self.cf.param.get_value("fwActLpf.cutoffHz"))
+        except Exception as exc:
+            self._log(f"[lpf] could not read back fwActLpf state: {exc}\n")
+            lpf_on, lpf_hz = -1, float("nan")
+        self.logs.write_event("FW_ACT_LPF", f"enable={lpf_on}", f"cutoffHz={lpf_hz}")
+        self._log(f"Output LPF {'ON' if lpf_on == 1 else 'OFF'} (deck reports "
+                  f"enable={lpf_on}, cutoffHz={lpf_hz})\n")
+        if lpf_on != int(self.config.fwactlpf_enable):
+            self._log("[lpf] WARNING: deck state does not match the Setup tab!\n")
 
         # Read back the persisted per-surface servo trims (UINT16, center each
         # surface in toServoPwm) so the GUI shows the stored values.
