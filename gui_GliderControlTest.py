@@ -1182,7 +1182,17 @@ class GliderWorker(QtCore.QObject):
         gr = float(data["controller.r_roll"]); gp = float(data["controller.r_pitch"])
         gy = float(data["controller.r_yaw"]); sp = float(data["controller.pitchRate"])
         sr = float(data["controller.rollRate"]); sy = float(data["controller.yawRate"])
-        self.buffers.add_controller(ts, gr, gp, gy, sr, sp, sy)
+        # controller.r_* is rad/s; controller.*Rate is deg/s (see flight_plots
+        # .RAD2DEG). The live axes are labelled deg/s, so the gyro side -- and
+        # only the gyro side -- is converted before plotting. The CSV keeps the
+        # raw firmware values so the on-disk format is unchanged and old logs
+        # stay comparable to new ones; flight_plots does the same conversion at
+        # load time.
+        self.buffers.add_controller(
+            ts,
+            gr * flight_plots.RAD2DEG, gp * flight_plots.RAD2DEG, gy * flight_plots.RAD2DEG,
+            sr, sp, sy,
+        )
         self.logs.controller.writerow([ts, gr, gp, gy, sr, sp, sy])
 
     def _on_motor_log(self, timestamp, data, _logconf):

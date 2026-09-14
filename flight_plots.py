@@ -48,9 +48,20 @@ SERVO_SPAN = 32767.0
 # servo_cmd (throttle) raw range -> normalise to 0..1.
 THROTTLE_MAX = 65535.0
 
-# Radians/sec -> deg/sec (gyro columns in Controller.csv are rad/s; set_* deg/s
-# in newer logs but historically rad/s -- we plot gyro converted to deg/s and
-# assume set_* share the gyro unit so the overlay lines up).
+# Radians/sec -> deg/sec. Applies to the gyro_* columns ONLY.
+#
+# The two halves of Controller.csv do not share a unit, despite sitting on the
+# same axes in the plot:
+#   gyro_*  <- controller.r_roll/r_pitch/r_yaw, which the firmware stores as
+#              radians(sensors->gyro.x) (controller_pid.c:139-141). Genuinely
+#              rad/s, so it needs this factor.
+#   set_*   <- controller.rollRate/pitchRate/yawRate, i.e. rateDesired.*, which
+#              is handed straight to attitudeControllerCorrectRatePID() next to
+#              the raw deg/s sensors->gyro.x (controller_pid.c:126-127). Already
+#              deg/s -- converting it again inflated every setpoint by 57.3x, so
+#              a 45 deg/s command plotted as ~2578.
+# The subscription has used these same variable names since the logger was
+# written, so this applies uniformly to old and new CSVs alike.
 RAD2DEG = 57.29577951308232
 
 # Which event types get a marked line, and how to draw them.
@@ -129,9 +140,10 @@ def _load_controller(fd: FlightData, prefix: str) -> None:
         fd.gyro["pitch"].append(gp * RAD2DEG)
         fd.gyro["yaw"].append(gy * RAD2DEG)
         fd.set_t.append(t)
-        fd.setp["roll"].append(sr * RAD2DEG)
-        fd.setp["pitch"].append(sp * RAD2DEG)
-        fd.setp["yaw"].append(sy * RAD2DEG)
+        # No RAD2DEG here: rateDesired.* is already deg/s. See the constant.
+        fd.setp["roll"].append(sr)
+        fd.setp["pitch"].append(sp)
+        fd.setp["yaw"].append(sy)
 
 
 def _load_accel(fd: FlightData, prefix: str) -> None:
