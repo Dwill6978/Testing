@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# Launcher for the glider ground station GUI, so it can be started as
+# "gliderground" from any directory (cf. cfclient).
+#
+# Install once with:
+#     ln -s "$PWD/gliderground" ~/.local/bin/gliderground
+#
+# readlink -f resolves that symlink before taking the dirname, so HERE is the
+# repo directory rather than ~/.local/bin. Without it, every path below would
+# point at the wrong place the moment the command is invoked via the symlink.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Run from the repo directory. The GUI already resolves its data paths off
+# __file__ (LOGS_DIR, CLIPPED_DIR, the *_defaults.json files), so this is not
+# strictly required -- but a few spots still fall back to "." (e.g. the Flight
+# Data folder box when cleared), and this makes launching from anywhere behave
+# identically to launching from the repo.
+cd "$HERE"
+
+# Invoked by path, not by module, so Python puts this directory at sys.path[0]
+# and the sibling imports (flight_plots, clip_flights) resolve without any
+# packaging or PYTHONPATH juggling.
+exec python3 "$HERE/gui_GliderControlTest.py" "$@"
