@@ -2664,7 +2664,14 @@ class MainWindow(QtWidgets.QMainWindow):
         series_btns.addWidget(fd_all_btn)
         series_btns.addWidget(fd_none_btn)
         series_btns.addStretch(1)
-        series_grid.addLayout(series_btns, 6, 0, 1, len(series_groups))
+        # Row index derived from the longest group rather than hardcoded: the
+        # checkboxes occupy rows 1..len(labels), so a fixed row silently lands on
+        # top of the last checkbox of the tallest column as soon as any group
+        # grows. That is what hid "cmd yaw" (6th entry of the rates column) --
+        # the box existed and toggled correctly, it was just covered by these
+        # buttons, which span every column.
+        series_btn_row = max(len(labels) for _, labels in series_groups) + 1
+        series_grid.addLayout(series_btns, series_btn_row, 0, 1, len(series_groups))
         sel_layout.addWidget(series_box)
 
         # Manual clip: for flights the auto-detector misses, read the start/end off
