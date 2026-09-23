@@ -114,6 +114,10 @@ class FlightData:
     # Detected flight windows (cf_time) to shade on a full-session plot so you can
     # see where each clip was cut from. Empty for single (clipped/raw) flights.
     clip_windows: List[Tuple[float, float]] = field(default_factory=list)
+    # (cf_time) spans where manual override was active. Collected from the events
+    # file WITHOUT the window filter, because the override toggle usually happens
+    # before takeoff and so falls outside a clipped flight's window.
+    override_spans: List[Tuple[float, float]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +247,71 @@ def _load_events(fd: FlightData, prefix: str) -> None:
     fd.events.sort(key=lambda e: e[0])
 
 
+def _load_override_spans(fd: FlightData, prefix: str) -> None:
+    """Collect the (cf_time) spans during which manual override was active.
+
+    Read from ``prefix``'s own events, unwindowed: the ON toggle is usually
+    flipped on the ground, so a windowed read would miss the state a flight was
+    already in. A clipped flight should be given its parent session's prefix --
+    the clip's own events file keeps only the rows inside its window, and the
+    ``# BREAKPOINT`` anchor lines needed to map host time to cf_time may not have
+    survived the cut at all. Clips copy cf_time verbatim, so spans measured on
+    the session apply to its clips unchanged.
+    """
+    anchors = cf._harvest_breakpoints(prefix)
+    if not anchors:
+        return
+    override_on: Optional[float] = None
+    for row in cf._iter_data_rows(f"{prefix}_Events.csv"):
+        if len(row) < 3 or row[1] != "BREAKPOINT":
+            continue
+        h = cf._parse_host(row[0])
+        if h is None:
+            continue
+        t = _host_to_cf(anchors, h)
+        if t is None:
+            continue
+        if row[2] == "MANUAL_OVERRIDE_ON" and override_on is None:
+            override_on = t
+        elif row[2] == "MANUAL_OVERRIDE_OFF" and override_on is not None:
+            fd.override_spans.append((override_on, t))
+            override_on = None
+    if override_on is not None:
+        # Override was never switched back off before the session ended.
+        fd.override_spans.append((override_on, float("inf")))
+
+
+def _drop_override_setpoints(fd: FlightData) -> None:
+    """Discard the commanded-rate samples recorded while manual override was on.
+
+    Manual override streams raw servo/motor PWM on the generic setpoint channel.
+    That decoder leaves setpoint_t zeroed, and a zeroed mode.roll/pitch is
+    modeDisable -- which controller_pid reads as "hold absolute attitude 0", not
+    as "no command". So the attitude PID runs against a level target while the
+    airframe is hand-flown, and its unclamped output lands in rateDesired, i.e.
+    in the controller.rollRate/pitchRate columns these traces come from. Add the
+    ground station's interleaved zero-setpoint supervisor keepalive and the
+    result is a spike train that swamps the shared y-axis and hides the gyro.
+
+    Those samples were never pilot commands, so they are dropped. Dropped rather
+    than NaN-filled so setp stays index-aligned with set_t for every consumer,
+    and dropped rather than clamped so nothing fake is drawn. The gyro traces are
+    untouched -- they are real measurements throughout.
+
+    Firmware build 6+ fixes this at the source (the decoder now selects
+    modeVelocity with a zero rate); this keeps every earlier log readable.
+    """
+    if not fd.override_spans or not fd.set_t:
+        return
+    keep = [i for i, t in enumerate(fd.set_t)
+            if not any(a <= t <= b for a, b in fd.override_spans)]
+    if len(keep) == len(fd.set_t):
+        return
+    fd.set_t = [fd.set_t[i] for i in keep]
+    for axis, vals in fd.setp.items():
+        fd.setp[axis] = [vals[i] for i in keep]
+
+
 def _add_derived_events(fd: FlightData) -> None:
     """Derive takeoff and landing markers with the SAME model clip_flights uses to
     cut the window, so they stay consistent with it: takeoff = the launch throw
@@ -302,7 +371,8 @@ def _add_window_markers(fd: FlightData, windows: List[Tuple[float, float]]) -> N
 def load_flight(prefix: str, name: Optional[str] = None,
                 window: Optional[Tuple[float, float]] = None,
                 detect_window: bool = False,
-                mark_all_windows: bool = False) -> FlightData:
+                mark_all_windows: bool = False,
+                session_prefix: Optional[str] = None) -> FlightData:
     """Load one flight's streams into a FlightData.
 
     ``prefix`` is the path prefix shared by the stream files (no ``_Stream.csv``).
@@ -314,6 +384,10 @@ def load_flight(prefix: str, name: Optional[str] = None,
     ``mark_all_windows`` is for plotting a whole unclipped session: instead of one
     derived takeoff/landing, mark every detected flight and record the windows so
     build_figure can shade where each clip was cut from.
+
+    ``session_prefix`` is the parent session of a clipped set, used only to read
+    manual-override spans that the clip itself cannot resolve (see
+    _load_override_spans). Harmless to omit; the masking just degrades.
     """
     if window is None and detect_window:
         windows = cf._detect_windows(cf._build_activity(prefix))
@@ -323,6 +397,8 @@ def load_flight(prefix: str, name: Optional[str] = None,
     _load_accel(fd, prefix)
     _load_motor(fd, prefix)
     _load_events(fd, prefix)
+    _load_override_spans(fd, session_prefix or prefix)
+    _drop_override_setpoints(fd)
     if mark_all_windows:
         _add_window_markers(fd, cf._detect_windows(cf._build_activity(prefix)))
     else:
@@ -438,6 +514,7 @@ class FlightRef:
     detect_window: bool       # whether load_flight should auto-detect the window
     window: Optional[Tuple[float, float]] = None  # explicit cf window (raw multi-flight)
     flight_index: Optional[int] = None  # 1-based index of a raw detected window
+    session_prefix: Optional[str] = None  # parent session of a clip, when known
 
 
 def enumerate_flights(directory: str, match: Optional[str] = None,
@@ -462,6 +539,7 @@ def enumerate_flights(directory: str, match: Optional[str] = None,
 
     # Clipped flights: prefixes ending in _flightN.
     seen = set()
+    clipped: List[FlightRef] = []
     for suffix in cf.STREAMS:
         for path in glob.glob(os.path.join(clip_root, "**", f"*_flight*_{suffix}.csv"),
                               recursive=True):
@@ -470,11 +548,14 @@ def enumerate_flights(directory: str, match: Optional[str] = None,
                 continue
             seen.add(prefix)
             name = os.path.basename(prefix)
-            refs.append(FlightRef(name, prefix, "clipped", detect_window=False))
+            ref = FlightRef(name, prefix, "clipped", detect_window=False)
+            clipped.append(ref)
+            refs.append(ref)
 
     # Raw sessions: the full unclipped session plus each auto-detected window, so
     # you can plot both and see whether detection missed or mis-cut anything.
-    for prefix in cf.find_sessions(directory, match):
+    sessions = cf.find_sessions(directory, match)
+    for prefix in sessions:
         windows = cf._detect_windows(cf._build_activity(prefix))
         base = os.path.basename(prefix)
         refs.append(FlightRef(f"{base} [full]", prefix, "full",
@@ -484,6 +565,16 @@ def enumerate_flights(directory: str, match: Optional[str] = None,
                                   detect_window=False, window=win,
                                   flight_index=i))
 
+    # Point each clip back at the session it was cut from (clip basenames are
+    # "<session>_flightN"). Only used to recover manual-override spans, which a
+    # clip cannot always resolve on its own -- see _load_override_spans.
+    for ref in clipped:
+        base = os.path.basename(ref.prefix)
+        for sess in sessions:
+            if base.startswith(os.path.basename(sess) + "_flight"):
+                ref.session_prefix = sess
+                break
+
     if match:
         refs = [r for r in refs if match in r.name]
     return sorted(refs, key=lambda r: r.name)
@@ -492,7 +583,8 @@ def enumerate_flights(directory: str, match: Optional[str] = None,
 def load_flight_ref(ref: FlightRef) -> FlightData:
     return load_flight(ref.prefix, name=ref.name, window=ref.window,
                        detect_window=ref.detect_window,
-                       mark_all_windows=(ref.source == "full"))
+                       mark_all_windows=(ref.source == "full"),
+                       session_prefix=ref.session_prefix)
 
 
 def session_start_time(prefix: str) -> float:
@@ -509,6 +601,10 @@ def describe_flight(fd: FlightData) -> str:
         lines.append(f"  window: cf {fd.window[0]:.1f}-{fd.window[1]:.1f}s "
                      f"({fd.window[1] - fd.window[0]:.0f}s)")
     lines.append(f"  gyro samples:  {len(fd.gyro_t)}")
+    dropped = len(fd.gyro_t) - len(fd.set_t)
+    if dropped > 0:
+        lines.append(f"  cmd samples:   {len(fd.set_t)} "
+                     f"({dropped} dropped: manual override, not pilot commands)")
     lines.append(f"  accel samples: {len(fd.acc_t)}")
     lines.append(f"  motor samples: {len(fd.mot_t)}")
     if fd.events:

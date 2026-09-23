@@ -1188,10 +1188,33 @@ class GliderWorker(QtCore.QObject):
         # raw firmware values so the on-disk format is unchanged and old logs
         # stay comparable to new ones; flight_plots does the same conversion at
         # load time.
+        with self._lock:
+            override = self.live.manual_override
+        if override:
+            # Under manual override the commanded-rate log variables do not hold
+            # pilot commands: the override packet bypasses the controller, and on
+            # firmware without the modeVelocity fix (crtp_commander_generic.c,
+            # manualMotorDecoder) the zeroed setpoint reads as modeDisable, i.e.
+            # "hold 0 deg attitude". The attitude PID then runs against level and
+            # its unclamped output lands in controller.rollRate/pitchRate, which
+            # is what these traces plot. Blanking them keeps the shared deg/s axes
+            # scaled to the gyro, which is the signal worth watching here.
+            #
+            # NaN rather than a dropped sample: the setpoint traces share t_ctrl
+            # with the gyro traces, so skipping would misalign every later point.
+            # matplotlib renders NaN as a gap, which also makes the override span
+            # visible instead of forging a flat zero line.
+            # The CSV still gets the raw firmware values: blanking is a display
+            # decision, and flight_plots masks these spans at load time using the
+            # MANUAL_OVERRIDE breakpoints, so the on-disk format stays unchanged
+            # and old logs stay comparable to new ones.
+            psr = psp = psy = float("nan")
+        else:
+            psr, psp, psy = sr, sp, sy
         self.buffers.add_controller(
             ts,
             gr * flight_plots.RAD2DEG, gp * flight_plots.RAD2DEG, gy * flight_plots.RAD2DEG,
-            sr, sp, sy,
+            psr, psp, psy,
         )
         self.logs.controller.writerow([ts, gr, gp, gy, sr, sp, sy])
 
