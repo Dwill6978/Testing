@@ -34,3 +34,14 @@ F12 same but 70 deg/s
 
 8/21 
 f1 p 170 r 100 y 300
+
+9/14 1:06
+
+9/22
+p(p/y):300 ff:300P(r):150 - f1/f2
+f3-cut ff to 150
+f4 - bump ff to 250
+f5 same
+f6 pitch and yaw ff to 200
+
+f7 no p only ff

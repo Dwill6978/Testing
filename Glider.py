@@ -45,7 +45,7 @@ def TurnRadius(W_S, C_L, g, phi, rho):
 if __name__ == '__main__':
 
     # Example usage
-    W_S = 2.15/0.1087  # N/m^2
+    W_S = 1.86/0.1087  # N/m^2
     C_L_max = arr.array('f',[1.2,0.55,0.48])  # Maximum Lift Coefficient
     rho = 1.225  # kg/m^3 (sea level standard atmosphere)
     C_D_0 = arr.array('f',[0.05,0.035,0.05]) # Zero-Lift Drag Coefficient
