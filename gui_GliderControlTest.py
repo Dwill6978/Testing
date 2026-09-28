@@ -169,6 +169,11 @@ PID_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gl
 # Written by "Save as launch defaults" on that tab, reloaded into the widgets at
 # startup. Keyed by SessionConfig field name -- see MainWindow._setup_bindings.
 SETUP_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_setup_defaults.json")
+# Persistent user button maps: named per-controller layouts edited on the Mapping
+# tab (which command sits on which button index, plus a human label for each
+# physical button). Several maps can be stored; one per controller type is marked
+# active and applied on Connect. Absent/corrupt file -> the built-in profile.
+CONTROLLER_MAPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_controller_maps.json")
 # Root folder that holds all flight logs. Each session's CSV/Console files are
 # written into a per-day subfolder (YYYYMMDD) so logs stay grouped by flight day.
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -693,6 +698,284 @@ CONTROLLER_PROFILES = {"xbox": XBOX_PROFILE, "rc": RC_PROFILE}
 
 
 # --------------------------------------------------------------------------- #
+# User-editable button maps (Mapping tab)
+# --------------------------------------------------------------------------- #
+# Every command the control loop actually reads, in display order. "latch" means
+# the handler mirrors the switch *position* (_latch_edge), so the action follows
+# the switch rather than toggling on each press; "edge" fires once per 0->1
+# transition (_edge_cmd).
+#
+# XBOX_PROFILE also carries "arm"/"disarm" entries, but nothing in
+# _poll_controller_buttons reads them -- arming is driven solely by the
+# "arm_latch" switch. They are deliberately left out of this list rather than
+# offered as mappable, because a button that silently does nothing is exactly
+# the kind of thing this tab exists to eliminate. (Worth revisiting separately.)
+CONTROLLER_COMMANDS: List[Tuple[str, str, str]] = [
+    ("arm_latch",     "Arm / disarm motor",            "latch"),
+    ("override_latch", "Manual override on / off",     "latch"),
+    ("trim_mode",     "Trim mode (rear knobs = trim)", "latch"),
+    ("pid_mode",      "PID-tune mode (rear knobs)",    "latch"),
+    ("trim_on",       "Trim ON / lock servos",         "edge"),
+    ("trim_off",      "Trim OFF / unlock servos",      "edge"),
+    ("auto_on",       "Autonomous mode ON",            "edge"),
+    ("auto_off",      "Autonomous mode OFF",           "edge"),
+    ("breakpoint",    "Write CSV breakpoint marker",   "edge"),
+    ("pid_sel_roll",  "PID tune: select roll",         "edge"),
+    ("pid_sel_pitch", "PID tune: select pitch",        "edge"),
+    ("pid_sel_yaw",   "PID tune: select yaw",          "edge"),
+    ("save_tune",     "Save trim / gains to flash",    "edge"),
+]
+
+# Commands whose loss or misassignment has flight-safety consequences. Leaving
+# these unmapped fails safe (you simply cannot arm, or cannot enter override),
+# but it should never happen silently -- the Mapping tab warns.
+SAFETY_CRITICAL_COMMANDS = {"arm_latch", "override_latch"}
+
+UNMAPPED = -1
+
+# The four primary flight axes, in display order:
+#   (key, label, detection prompt, expected logical sign for that gesture)
+#
+# The last field is the part worth understanding. Detection can tell which axis
+# moved and which way it went in *raw SDL* terms, but "which way is correct" is a
+# convention this codebase already fixed, and it is NOT uniformly +1:
+#
+#   roll     RC_PROFILE a0, sign +1. SDL: stick right = +1  -> right is POSITIVE.
+#   pitch    RC_PROFILE a1, sign +1, and the profile docstring states the SDL
+#            convention "stick up = negative Y for pitch". Stick up therefore
+#            reads -1 and stays -1 -> up is NEGATIVE.
+#   yaw      SDL: stick right = +1 -> right is POSITIVE. (RC_PROFILE carries
+#            yaw_sign=-1, but that is an *airframe* reversal, not the controller
+#            convention, so it belongs in `inverted`, not here.)
+#
+# Throttle is absent on purpose: it does not use a sign at all. It is calibrated
+# by raw endpoints (throttle_idle_raw/throttle_full_raw), which detection
+# captures directly, so direction falls out of the calibration for free.
+AXIS_CONTROLS: List[Tuple[str, str, str, float]] = [
+    ("roll",     "Aileron / roll",    "Move the AILERON stick fully RIGHT",  +1.0),
+    ("pitch",    "Elevator / pitch",  "Move the ELEVATOR stick fully UP",    -1.0),
+    ("yaw",      "Rudder / yaw",      "Move the RUDDER stick fully RIGHT",   +1.0),
+    ("throttle", "Throttle",          "Move the THROTTLE stick fully UP",     0.0),
+]
+
+# Detection tuning. The capture window has to be long enough to reach a stop
+# without feeling like a hang, and the minimum deviation has to reject "the user
+# clicked Detect and then nothing happened" -- 0.15 matches interlink_tester.py.
+AXIS_DETECT_BASELINE_S = 0.8
+AXIS_DETECT_CAPTURE_S = 4.0
+AXIS_DETECT_MIN_DEV = 0.15
+
+
+@dataclass
+class ControllerMap:
+    """A named, user-editable button layout for one controller type.
+
+    Two independent things live here on purpose. ``commands`` is the mapping
+    (which action sits on which button index); ``names`` is a description of the
+    *hardware* (what the user calls each physical button). Keeping them separate
+    means relabelling a switch never disturbs an assignment, and reassigning an
+    action never loses a label.
+    """
+    name: str
+    controller_type: str = "rc"
+    commands: Dict[str, int] = field(default_factory=dict)
+    names: Dict[int, str] = field(default_factory=dict)
+    # Primary flight axes: "roll"/"pitch"/"yaw"/"throttle" -> axis index, plus the
+    # sign that orients each one. Detection sets the index and the orientation
+    # sign; `inverted` is the user's separate "this surface moves the wrong way on
+    # my airframe" flip, kept apart so re-detecting an axis never silently undoes
+    # a reversal that was established by actually flying it.
+    axes: Dict[str, int] = field(default_factory=dict)
+    axis_signs: Dict[str, float] = field(default_factory=dict)
+    inverted: Dict[str, bool] = field(default_factory=dict)
+    # Throttle-stick calibration captured during detection: the raw axis reading
+    # at rest and at full. None -> keep the built-in profile's values.
+    throttle_idle_raw: Optional[float] = None
+    throttle_full_raw: Optional[float] = None
+
+    def effective_sign(self, control: str) -> float:
+        """The sign actually written into the profile: detected orientation
+        combined with the user's invert flag."""
+        base = float(self.axis_signs.get(control, 1.0))
+        return -base if self.inverted.get(control) else base
+
+    def button_label(self, idx: int) -> str:
+        """Human text for a button index: the user's name if they gave one,
+        otherwise a bare index. Used everywhere a button is shown."""
+        if idx is None or idx < 0:
+            return "— unmapped —"
+        custom = self.names.get(idx, "").strip()
+        return f"{idx} — {custom}" if custom else f"button {idx}"
+
+    def conflicts(self) -> Dict[int, List[str]]:
+        """Button indices carrying more than one command -> the command names.
+        Double-booking is legal (some layouts genuinely want it) but is almost
+        always a mistake, so the tab surfaces it rather than blocking it."""
+        by_idx: Dict[int, List[str]] = {}
+        for cmd, idx in self.commands.items():
+            if idx is not None and idx >= 0:
+                by_idx.setdefault(idx, []).append(cmd)
+        return {i: cmds for i, cmds in by_idx.items() if len(cmds) > 1}
+
+    def warnings(self) -> List[str]:
+        """Human-readable problems worth showing before this map is used.
+        Warn-but-allow: none of these prevent the map being applied."""
+        out: List[str] = []
+        for cmd in sorted(SAFETY_CRITICAL_COMMANDS):
+            if self.commands.get(cmd, UNMAPPED) < 0:
+                label = dict((c, l) for c, l, _ in CONTROLLER_COMMANDS).get(cmd, cmd)
+                out.append(f"'{label}' is unmapped — it cannot be triggered from the controller.")
+        for idx, cmds in sorted(self.conflicts().items()):
+            out.append(f"{self.button_label(idx)} is assigned to {len(cmds)} commands: "
+                       + ", ".join(sorted(cmds)))
+
+        # Axes. Unlike buttons, none of these are optional: every one drives a
+        # control surface or the motor, so an unset axis is always a fault.
+        axis_labels = {k: l for k, l, _, _ in AXIS_CONTROLS}
+        by_axis: Dict[int, List[str]] = {}
+        for key, _, _, _ in AXIS_CONTROLS:
+            idx = self.axes.get(key, UNMAPPED)
+            if idx is None or idx < 0:
+                out.append(f"'{axis_labels[key]}' has no axis assigned — that control is dead.")
+            else:
+                by_axis.setdefault(idx, []).append(axis_labels[key])
+        for idx, ctrls in sorted(by_axis.items()):
+            if len(ctrls) > 1:
+                out.append(f"Axis {idx} is shared by {', '.join(sorted(ctrls))} — "
+                           f"one stick would move two surfaces.")
+        if self.throttle_idle_raw is not None and self.throttle_full_raw is not None:
+            span = abs(self.throttle_idle_raw - self.throttle_full_raw)
+            if span < 0.2:
+                out.append(f"Throttle travel is only {span:.2f} of full scale — "
+                           f"re-detect it and move the stick all the way.")
+        return out
+
+
+def default_controller_map(controller_type: str) -> ControllerMap:
+    """A ControllerMap seeded from the built-in profile, so a first-time user starts
+    from the working layout instead of a blank sheet."""
+    prof = CONTROLLER_PROFILES.get(controller_type, XBOX_PROFILE)
+    cmds = {cmd: int(prof.buttons.get(cmd, UNMAPPED)) for cmd, _, _ in CONTROLLER_COMMANDS}
+    axes = {"roll": prof.roll_axis, "pitch": prof.pitch_axis,
+            "yaw": prof.yaw_axis, "throttle": prof.throttle_axis}
+    # Seed orientation from the profile's *_sign, but split it: the magnitude-1
+    # sign the profile carries is the product of convention and any airframe
+    # reversal, and we cannot tell them apart from here. Treat a negative profile
+    # sign as the user's invert flag (that is what it was used for -- RC yaw was
+    # flipped because the rudder was reversed on this airframe), leaving the
+    # detected orientation at the convention default.
+    signs = {"roll": prof.roll_sign, "pitch": prof.pitch_sign,
+             "yaw": prof.yaw_sign, "throttle": prof.throttle_sign}
+    inverted = {k: (v < 0) for k, v in signs.items()}
+    return ControllerMap(name=f"{prof.label} (built-in)", controller_type=controller_type,
+                         commands=cmds, names={}, axes=axes,
+                         axis_signs={k: 1.0 for k in axes}, inverted=inverted,
+                         throttle_idle_raw=prof.throttle_idle_raw,
+                         throttle_full_raw=prof.throttle_full_raw)
+
+
+def load_controller_maps() -> Tuple[Dict[str, ControllerMap], Dict[str, str]]:
+    """Read every saved map plus the active-map choice per controller type.
+
+    Mirrors the tolerance of load_default_gains/_load_setup_defaults: a missing
+    or malformed file, or any single bad entry, degrades to the built-in profile
+    rather than raising. A controller config that throws on startup would leave
+    the GUI unusable at the flight line.
+    """
+    maps: Dict[str, ControllerMap] = {}
+    active: Dict[str, str] = {}
+    try:
+        with open(CONTROLLER_MAPS_FILE, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return maps, active
+    except (OSError, ValueError):
+        return maps, active
+    if not isinstance(saved, dict):
+        return maps, active
+
+    for name, entry in (saved.get("maps") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        ctype = entry.get("controller_type", "rc")
+        if ctype not in CONTROLLER_PROFILES:
+            continue
+        bm = ControllerMap(name=str(name), controller_type=ctype)
+        for cmd, _, _ in CONTROLLER_COMMANDS:
+            try:
+                bm.commands[cmd] = int((entry.get("commands") or {}).get(cmd, UNMAPPED))
+            except (TypeError, ValueError):
+                bm.commands[cmd] = UNMAPPED
+        # JSON object keys are always strings; button indices are ints here.
+        for k, v in (entry.get("names") or {}).items():
+            try:
+                bm.names[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+        # Axes. A map written before axis support existed simply has no "axes"
+        # key; fall back to the built-in profile per control rather than dropping
+        # the whole map, so an existing button layout keeps working.
+        seed = default_controller_map(ctype)
+        for key, _, _, _ in AXIS_CONTROLS:
+            try:
+                bm.axes[key] = int((entry.get("axes") or {}).get(key, seed.axes[key]))
+            except (TypeError, ValueError):
+                bm.axes[key] = seed.axes[key]
+            try:
+                bm.axis_signs[key] = float(
+                    (entry.get("axis_signs") or {}).get(key, seed.axis_signs[key]))
+            except (TypeError, ValueError):
+                bm.axis_signs[key] = 1.0
+            bm.inverted[key] = bool(
+                (entry.get("inverted") or {}).get(key, seed.inverted[key]))
+        for attr in ("throttle_idle_raw", "throttle_full_raw"):
+            raw = entry.get(attr)
+            try:
+                setattr(bm, attr, float(raw) if raw is not None else getattr(seed, attr))
+            except (TypeError, ValueError):
+                setattr(bm, attr, getattr(seed, attr))
+        maps[bm.name] = bm
+
+    for ctype, name in (saved.get("active") or {}).items():
+        if ctype in CONTROLLER_PROFILES and isinstance(name, str):
+            active[ctype] = name
+    return maps, active
+
+
+def save_controller_maps(maps: Dict[str, ControllerMap], active: Dict[str, str]) -> None:
+    """Persist all maps (raises OSError on failure, like save_default_gains)."""
+    payload = {
+        "version": 1,
+        "active": active,
+        "maps": {
+            bm.name: {
+                "controller_type": bm.controller_type,
+                "commands": bm.commands,
+                "names": {str(k): v for k, v in bm.names.items()},
+                "axes": bm.axes,
+                "axis_signs": bm.axis_signs,
+                "inverted": bm.inverted,
+                "throttle_idle_raw": bm.throttle_idle_raw,
+                "throttle_full_raw": bm.throttle_full_raw,
+            }
+            for bm in maps.values()
+        },
+    }
+    with open(CONTROLLER_MAPS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def active_controller_map(controller_type: str) -> Optional[ControllerMap]:
+    """The saved map marked active for this controller type, or None to use the
+    built-in profile untouched."""
+    maps, active = load_controller_maps()
+    name = active.get(controller_type)
+    if not name:
+        return None
+    return maps.get(name)
+
+
+# --------------------------------------------------------------------------- #
 # Worker: connection + control loop (runs on its own thread)
 # --------------------------------------------------------------------------- #
 class GliderWorker(QtCore.QObject):
@@ -705,6 +988,8 @@ class GliderWorker(QtCore.QObject):
     trim_value = Signal(str, int)  # (axis, value) trim read back from the deck / live trim
     surface_map = Signal(str, int, int)  # (channel, surface_code, invert) read back from deck
     pid_value = Signal(str, str, float)  # (axis, term, value) live in-flight PID tune
+    buttons_state = Signal(object)  # (armed, n_buttons, frozenset of pressed indices)
+    axes_state = Signal(object)     # (armed, tuple of raw axis values) for axis detect
 
     def __init__(self, buffers: PlotBuffers):
         super().__init__()
@@ -729,6 +1014,13 @@ class GliderWorker(QtCore.QObject):
         self.last_connection_seen_at = 0.0
         self.last_button_state: Dict[int, int] = {}
         self.last_hat_state: Tuple[int, int] = (0, 0)
+        # Live button state pushed to the Mapping tab. SDL may only be read from
+        # the thread that owns the joystick, so the GUI cannot poll it directly --
+        # the worker samples it here and emits. Cached so we only signal on an
+        # actual change (plus a slow heartbeat), instead of 100 emits a second.
+        self._last_buttons_sent: Optional[frozenset] = None
+        self._last_buttons_emit = 0.0
+        self._last_axes_emit = 0.0
         self.last_override_servo = 0
         # Manual-override state: cache of last param value actually written
         # (dirty-check to avoid flooding the radio) + non-blocking servo slew.
@@ -761,7 +1053,16 @@ class GliderWorker(QtCore.QObject):
         if self._thread and self._thread.is_alive():
             return
         self.config = config
-        self.profile = CONTROLLER_PROFILES.get(config.controller_type, XBOX_PROFILE)
+        base = CONTROLLER_PROFILES.get(config.controller_type, XBOX_PROFILE)
+        # Copy the profile (and its buttons dict) before anything can edit it.
+        # XBOX_PROFILE / RC_PROFILE are module-level singletons, so applying a
+        # user map in place would permanently mutate the built-in layout for the
+        # rest of the process -- including the "revert to built-in" path, which
+        # would then revert to the edited values.
+        self.profile = ControllerProfile(**{**asdict(base), "buttons": dict(base.buttons)})
+        saved = active_controller_map(config.controller_type)
+        if saved is not None:
+            self._apply_controller_map(saved)
         self._stop.clear()
         self.failsafe_active = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -773,6 +1074,35 @@ class GliderWorker(QtCore.QObject):
     def post(self, action: str, payload: object = None) -> None:
         """Queue a one-shot command for the worker loop."""
         self._cmd_queue.put((action, payload))
+
+    def _apply_controller_map(self, bmap: "ControllerMap") -> None:
+        """Overwrite the active profile's button and axis assignments from a map.
+
+        Only entries present in the map are touched, and UNMAPPED (-1) is stored
+        verbatim: _edge_cmd/_latch_edge already treat a negative index as 'not
+        present on this device' and skip it, so unmapping is a no-op at read time
+        rather than a special case anywhere in the control loop. _axis_c applies
+        the same rule to axes.
+        """
+        for cmd, idx in bmap.commands.items():
+            self.profile.buttons[cmd] = int(idx)
+        for key, idx in bmap.axes.items():
+            attr = f"{key}_axis"
+            if hasattr(self.profile, attr):
+                setattr(self.profile, attr, int(idx))
+                setattr(self.profile, f"{key}_sign", bmap.effective_sign(key))
+        if bmap.throttle_idle_raw is not None:
+            self.profile.throttle_idle_raw = float(bmap.throttle_idle_raw)
+        if bmap.throttle_full_raw is not None:
+            self.profile.throttle_full_raw = float(bmap.throttle_full_raw)
+        # axis_centers is sampled for EVERY axis at connect, not just the mapped
+        # ones, so remapping indices needs no re-sample -- the rest offset for the
+        # newly chosen index is already there.
+        # Drop stale edge/latch history: a command that just moved to a different
+        # button must not inherit the old button's last level, or the first poll
+        # after a remap would read a phantom transition and fire the action.
+        self.last_button_state.clear()
+        self._latch_prev.clear()
 
     def update_live(self, **kwargs) -> None:
         """Mutate continuous control values atomically."""
@@ -1287,6 +1617,8 @@ class GliderWorker(QtCore.QObject):
                 pygame.event.get()
 
             self._drain_commands()
+            self._emit_button_state()
+            self._emit_axes_state()
 
             if (
                 self.log_enabled.get("connection", False)
@@ -1330,6 +1662,54 @@ class GliderWorker(QtCore.QObject):
                     self._set_bl_motor_throttle(live.throttle)
 
             time.sleep(0.01)
+
+    def _emit_button_state(self) -> None:
+        """Publish which physical buttons are down, for the Mapping tab's live
+        indicator and its Learn function.
+
+        Change-driven rather than rate-driven: a press or release emits on the very
+        next tick (~10 ms, so Learn feels instant), while a controller sitting still
+        costs one emit every half second. The heartbeat exists so a tab opened after
+        the fact still gets a starting picture instead of waiting for a press.
+        """
+        if self.joystick is None:
+            self._last_buttons_sent = None
+            return
+        try:
+            n = self.joystick.get_numbuttons()
+            pressed = frozenset(i for i in range(n) if self.joystick.get_button(i))
+        except Exception:
+            # A controller yanked mid-flight raises here; the reconnect path owns
+            # recovery, this display is not worth propagating an exception for.
+            return
+        now = time.monotonic()
+        if pressed == self._last_buttons_sent and (now - self._last_buttons_emit) < 0.5:
+            return
+        self._last_buttons_sent = pressed
+        self._last_buttons_emit = now
+        self.buttons_state.emit((self._live_snapshot().motor_armed, n, pressed))
+
+    def _emit_axes_state(self) -> None:
+        """Publish raw axis values for the Mapping tab's live readout and its
+        axis detection.
+
+        Fixed ~25 Hz rather than change-driven: unlike buttons, an axis is never
+        still (noise moves the last decimal constantly), so a change filter would
+        emit on every tick and save nothing. 25 Hz is smooth to watch and gives
+        detection ~100 samples over its capture window -- ample for a peak search.
+        """
+        if self.joystick is None:
+            return
+        now = time.monotonic()
+        if (now - self._last_axes_emit) < 0.04:
+            return
+        self._last_axes_emit = now
+        try:
+            values = tuple(self.joystick.get_axis(i)
+                           for i in range(self.joystick.get_numaxes()))
+        except Exception:
+            return
+        self.axes_state.emit((self._live_snapshot().motor_armed, values))
 
     def _feed_supervisor_keepalive(self) -> None:
         """Keep the firmware supervisor in a motors-allowed state during manual
@@ -1429,6 +1809,25 @@ class GliderWorker(QtCore.QObject):
                       f"{'fast/streamed' if self._fast_override else 'param (legacy)'}.\n")
         elif action == "reconnect_controller":
             self._reconnect_controller()
+        elif action == "set_controller_map":
+            # Runtime remap. This arrives through the same queue as every other
+            # GUI->worker change, which is the whole point: the control loop reads
+            # profile.buttons ~100 times a second, and applying the new dict here
+            # (on the worker thread, between ticks) means neither side needs a lock.
+            if payload is None:
+                # "Revert to built-in": rebuild the profile from the module-level
+                # template rather than trying to undo the edits in place.
+                base = CONTROLLER_PROFILES.get(self.config.controller_type, XBOX_PROFILE)
+                self.profile = ControllerProfile(
+                    **{**asdict(base), "buttons": dict(base.buttons)})
+                self.last_button_state.clear()
+                self._latch_prev.clear()
+                self._log("Button map reverted to the built-in layout.\n")
+            else:
+                self._apply_controller_map(payload)
+                self._log(f"Button map '{payload.name}' applied.\n")
+            self.logs.write_event("CONTROLLER_MAP_APPLIED",
+                                  payload.name if payload is not None else "built-in")
         elif action == "event":
             self.logs.write_event(*payload)
 
@@ -2024,31 +2423,6 @@ class GliderWorker(QtCore.QObject):
 
 
 # --------------------------------------------------------------------------- #
-# Button-mapping reference (shown in the Mapping tab)
-# --------------------------------------------------------------------------- #
-# Columns: (action, Xbox 360 control, InterLink-X (RC) control)
-# Xbox reflects the common SDL2/xpad layout for a wired 360 pad on Linux; the
-# InterLink-X column reflects the indices verified with interlink_tester.py
-# --wizard (7 axes, 17 buttons, no hat). Indices can differ by driver/OS -- if a
-# controller behaves oddly, verify with `jstest /dev/input/js0` (or the tester).
-# The active mapping is whichever profile is picked by the Setup-tab dropdown
-# (see XBOX_PROFILE / RC_PROFILE).
-BUTTON_MAPPING = [
-    ("Roll command", "Right stick X (axis 3)", "Right stick X / aileron (axis 0)"),
-    ("Pitch command", "Right stick Y (axis 4)", "Right stick Y / elevator (axis 1)"),
-    ("Yaw command", "Left stick X (axis 0)", "Left stick X / rudder (axis 5)"),
-    ("Throttle", "Left stick Y (axis 1) + D-pad Up/Down", "Left stick / throttle (axis 2, absolute)"),
-    ("Trim ON", "A / green (button 0)", "button 12"),
-    ("Trim OFF", "Y / yellow (button 3)", "button 11"),
-    ("Arm motor", "LB / left bumper (button 4)", "button 5"),
-    ("Disarm motor", "RB / right bumper (button 5)", "button 6"),
-    ("Enable autonomous mode", "X / blue (button 2)", "button 9"),
-    ("Disable autonomous mode", "B / red (button 1)", "button 10"),
-    ("Manual CSV breakpoint", "Right stick click / R3 (button 10)", "button 14"),
-]
-
-
-# --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QtWidgets.QMainWindow):
@@ -2074,6 +2448,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.trim_value.connect(self._on_trim_value)
         self.worker.surface_map.connect(self._on_surface_map)
         self.worker.pid_value.connect(self._on_pid_value)
+        self.worker.buttons_state.connect(self._on_buttons_state)
+        self.worker.axes_state.connect(self._on_axes_state)
 
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -2557,22 +2933,729 @@ class MainWindow(QtWidgets.QMainWindow):
             spin.setValue(int(value))
             spin.blockSignals(False)
 
+    # ----- Mapping tab: editable button layouts ---------------------------- #
+    # The tab edits a *draft* ControllerMap held in self._map_draft, never the saved
+    # file and never the worker's live profile. Nothing leaves this tab until the
+    # user presses Save, which is what makes Revert cheap and makes a half-finished
+    # edit harmless if the GUI is closed.
     def _build_mapping_tab(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(w)
-        table = QtWidgets.QTableWidget(len(BUTTON_MAPPING), 3)
-        table.setHorizontalHeaderLabels(
-            ["Action", "Xbox 360", "InterLink-X (RC)"])
-        table.horizontalHeader().setStretchLastSection(True)
-        table.verticalHeader().setVisible(False)
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        for row, (act, xbox, rc) in enumerate(BUTTON_MAPPING):
-            table.setItem(row, 0, QtWidgets.QTableWidgetItem(act))
-            table.setItem(row, 1, QtWidgets.QTableWidgetItem(xbox))
-            table.setItem(row, 2, QtWidgets.QTableWidgetItem(rc))
-        table.resizeColumnsToContents()
-        layout.addWidget(table)
+
+        self._map_draft: ControllerMap = default_controller_map("rc")
+        self._map_dirty = False
+        self._map_learn_cmd: Optional[str] = None   # command awaiting a press
+        self._map_armed = False                     # last known motor_armed
+        self._map_nbuttons = 0                      # buttons the pad reports
+        self._map_pressed: frozenset = frozenset()
+        self._map_loading = False                   # suppress widget signals
+        self._map_axis_values: Tuple[float, ...] = ()
+        self._map_detect: Optional[dict] = None     # in-flight axis detection
+
+        # --- row 1: which controller, which saved map ---------------------- #
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Controller:"))
+        self.map_ctype_combo = QtWidgets.QComboBox()
+        for label, key in (("Xbox / gamepad", "xbox"),
+                           ("RC sim controller (InterLink-X)", "rc")):
+            self.map_ctype_combo.addItem(label, key)
+        self.map_ctype_combo.setCurrentIndex(1)
+        self.map_ctype_combo.currentIndexChanged.connect(self._map_on_ctype_changed)
+        top.addWidget(self.map_ctype_combo)
+
+        top.addSpacing(16)
+        top.addWidget(QtWidgets.QLabel("Saved map:"))
+        self.map_name_combo = QtWidgets.QComboBox()
+        self.map_name_combo.setMinimumWidth(220)
+        self.map_name_combo.currentIndexChanged.connect(self._map_on_name_changed)
+        top.addWidget(self.map_name_combo)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        # --- row 2: what you can do with it -------------------------------- #
+        btns = QtWidgets.QHBoxLayout()
+        self.map_save_btn = QtWidgets.QPushButton("Save")
+        self.map_save_btn.setToolTip("Overwrite the selected map and apply it now.")
+        self.map_save_btn.clicked.connect(self._map_save)
+        self.map_saveas_btn = QtWidgets.QPushButton("Save as...")
+        self.map_saveas_btn.setToolTip("Store these edits under a new name.")
+        self.map_saveas_btn.clicked.connect(self._map_save_as)
+        self.map_delete_btn = QtWidgets.QPushButton("Delete")
+        self.map_delete_btn.clicked.connect(self._map_delete)
+        self.map_revert_btn = QtWidgets.QPushButton("Revert to built-in")
+        self.map_revert_btn.setToolTip(
+            "Discard edits and reload this controller's factory layout.")
+        self.map_revert_btn.clicked.connect(self._map_revert)
+        for b in (self.map_save_btn, self.map_saveas_btn,
+                  self.map_delete_btn, self.map_revert_btn):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        layout.addLayout(btns)
+
+        # --- banners: arm lock, then validation ---------------------------- #
+        self.map_lock_label = QtWidgets.QLabel()
+        self.map_lock_label.setStyleSheet(
+            "color: #b00020; font-weight: bold; padding: 4px;")
+        self.map_lock_label.setVisible(False)
+        layout.addWidget(self.map_lock_label)
+
+        self.map_warn_label = QtWidgets.QLabel()
+        self.map_warn_label.setWordWrap(True)
+        self.map_warn_label.setStyleSheet(
+            "color: #8a6d00; background: #fff8e1; border: 1px solid #ffe082; padding: 6px;")
+        self.map_warn_label.setVisible(False)
+        layout.addWidget(self.map_warn_label)
+
+        # --- the two tables ------------------------------------------------ #
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        # Left: the hardware. One row per physical button the pad reports, with a
+        # live pressed indicator so you can name a switch by flipping it.
+        left = QtWidgets.QWidget()
+        lv = QtWidgets.QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.addWidget(QtWidgets.QLabel(
+            "<b>Physical buttons</b> — press one on the controller to find it, "
+            "then type a name for it."))
+        self.map_btn_table = QtWidgets.QTableWidget(0, 4)
+        self.map_btn_table.setHorizontalHeaderLabels(
+            ["#", "Your name for it", "Now", "Assigned to"])
+        self.map_btn_table.verticalHeader().setVisible(False)
+        self.map_btn_table.horizontalHeader().setStretchLastSection(True)
+        self.map_btn_table.itemChanged.connect(self._map_on_name_edited)
+        lv.addWidget(self.map_btn_table)
+        split.addWidget(left)
+
+        # Right: the software. One row per command the control loop actually reads.
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.addWidget(QtWidgets.QLabel(
+            "<b>Actions</b> — choose the button for each, or leave it unmapped."))
+        self.map_cmd_table = QtWidgets.QTableWidget(len(CONTROLLER_COMMANDS), 4)
+        self.map_cmd_table.setHorizontalHeaderLabels(
+            ["Action", "Kind", "Button", ""])
+        self.map_cmd_table.verticalHeader().setVisible(False)
+        self.map_cmd_table.horizontalHeader().setStretchLastSection(False)
+        self.map_cmd_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.map_cmd_combos: Dict[str, QtWidgets.QComboBox] = {}
+        self.map_learn_btns: Dict[str, QtWidgets.QPushButton] = {}
+        for row, (cmd, label, kind) in enumerate(CONTROLLER_COMMANDS):
+            self.map_cmd_table.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
+            kind_item = QtWidgets.QTableWidgetItem(
+                "switch" if kind == "latch" else "press")
+            kind_item.setToolTip(
+                "switch: the action follows the switch position (on while up)."
+                if kind == "latch" else
+                "press: the action fires once each time the button goes down.")
+            self.map_cmd_table.setItem(row, 1, kind_item)
+            combo = QtWidgets.QComboBox()
+            # Bind cmd by default arg: a bare closure over the loop variable would
+            # leave every row pointing at the last command.
+            combo.currentIndexChanged.connect(
+                lambda _i, c=cmd: self._map_on_assign_changed(c))
+            self.map_cmd_table.setCellWidget(row, 2, combo)
+            self.map_cmd_combos[cmd] = combo
+            learn = QtWidgets.QPushButton("Learn")
+            learn.setCheckable(True)
+            learn.setToolTip("Click, then press the button you want for this action.")
+            learn.clicked.connect(lambda _c=False, c=cmd: self._map_learn(c))
+            self.map_cmd_table.setCellWidget(row, 3, learn)
+            self.map_learn_btns[cmd] = learn
+        self.map_cmd_table.resizeColumnsToContents()
+        rv.addWidget(self.map_cmd_table)
+        split.addWidget(right)
+        split.setSizes([420, 620])
+        layout.addWidget(split, 1)
+
+        # --- axes: detect-by-moving -------------------------------------- #
+        layout.addWidget(QtWidgets.QLabel(
+            "<b>Sticks</b> — click Detect, then move only that control fully in "
+            "the named direction. The axis that moves most is locked in."))
+
+        self.map_axis_table = QtWidgets.QTableWidget(len(AXIS_CONTROLS), 5)
+        self.map_axis_table.setHorizontalHeaderLabels(
+            ["Control", "Axis", "Live", "Reversed", "Detect"])
+        self.map_axis_table.verticalHeader().setVisible(False)
+        self.map_axis_table.horizontalHeader().setStretchLastSection(False)
+        self.map_axis_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.map_axis_combos: Dict[str, QtWidgets.QComboBox] = {}
+        self.map_axis_invert: Dict[str, QtWidgets.QCheckBox] = {}
+        self.map_axis_detect_btns: Dict[str, QtWidgets.QPushButton] = {}
+        self.map_axis_live: Dict[str, QtWidgets.QTableWidgetItem] = {}
+        for row, (key, label, prompt, _) in enumerate(AXIS_CONTROLS):
+            item = QtWidgets.QTableWidgetItem(label)
+            item.setToolTip(prompt)
+            self.map_axis_table.setItem(row, 0, item)
+
+            combo = QtWidgets.QComboBox()
+            combo.currentIndexChanged.connect(
+                lambda _i, k=key: self._map_on_axis_changed(k))
+            self.map_axis_table.setCellWidget(row, 1, combo)
+            self.map_axis_combos[key] = combo
+
+            live = QtWidgets.QTableWidgetItem("—")
+            live.setFlags(live.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.map_axis_table.setItem(row, 2, live)
+            self.map_axis_live[key] = live
+
+            chk = QtWidgets.QCheckBox()
+            chk.setToolTip(
+                "Tick if this surface deflects the wrong way on the aircraft.\n"
+                "Kept separate from detection, so re-detecting the axis will not "
+                "undo a reversal you found by flying it."
+                if key != "throttle" else
+                "Throttle direction comes from its calibration, not a sign — "
+                "re-detect the throttle instead of using this.")
+            chk.setEnabled(key != "throttle")
+            chk.toggled.connect(lambda on, k=key: self._map_on_invert_changed(k, on))
+            holder = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout(holder)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(chk)
+            hl.setAlignment(QtCore.Qt.AlignCenter)
+            self.map_axis_table.setCellWidget(row, 3, holder)
+            self.map_axis_invert[key] = chk
+
+            det = QtWidgets.QPushButton("Detect")
+            det.setCheckable(True)
+            det.setToolTip(prompt)
+            det.clicked.connect(lambda _c=False, k=key: self._map_detect_axis(k))
+            self.map_axis_table.setCellWidget(row, 4, det)
+            self.map_axis_detect_btns[key] = det
+        self.map_axis_table.resizeColumnsToContents()
+        self.map_axis_table.setMaximumHeight(
+            self.map_axis_table.horizontalHeader().height()
+            + self.map_axis_table.rowHeight(0) * len(AXIS_CONTROLS) + 4)
+        layout.addWidget(self.map_axis_table)
+
+        self.map_axis_status = QtWidgets.QLabel(
+            "Centre the sticks before detecting. Changes take effect on the "
+            "connected controller as soon as you press Save.")
+        self.map_axis_status.setWordWrap(True)
+        self.map_axis_status.setStyleSheet("color: #555;")
+        layout.addWidget(self.map_axis_status)
+
+        self._map_reload_names()
         return w
+
+    # ----- Mapping tab: state plumbing ------------------------------------- #
+    def _map_ctype(self) -> str:
+        return self.map_ctype_combo.currentData() or "rc"
+
+    def _map_reload_names(self) -> None:
+        """Repopulate the saved-map dropdown for the selected controller type and
+        select whichever map is marked active (or the built-in placeholder)."""
+        maps, active = load_controller_maps()
+        ctype = self._map_ctype()
+        self._map_loading = True
+        self.map_name_combo.clear()
+        # None as item data means "no saved map -- use the built-in profile".
+        self.map_name_combo.addItem("<built-in layout>", None)
+        for name in sorted(n for n, bm in maps.items() if bm.controller_type == ctype):
+            self.map_name_combo.addItem(name, name)
+        want = active.get(ctype)
+        idx = self.map_name_combo.findData(want) if want else 0
+        self.map_name_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._map_loading = False
+        self._map_load_selected()
+
+    def _map_load_selected(self) -> None:
+        """Make the dropdown's selection the working draft."""
+        name = self.map_name_combo.currentData()
+        ctype = self._map_ctype()
+        if name is None:
+            self._map_draft = default_controller_map(ctype)
+        else:
+            maps, _ = load_controller_maps()
+            self._map_draft = maps.get(name) or default_controller_map(ctype)
+        # Remembered separately from the draft's own name, because the built-in
+        # placeholder has a display name but no identity in the combo (data None).
+        self._map_selected: Optional[str] = name
+        self._map_dirty = False
+        self._map_cancel_learn()
+        self._map_cancel_detect()
+        self._map_refresh()
+
+    def _map_on_ctype_changed(self) -> None:
+        if self._map_loading:
+            return
+        self._map_reload_names()
+
+    def _map_on_name_changed(self) -> None:
+        if self._map_loading:
+            return
+        if self._map_dirty and not self._map_confirm_discard():
+            return
+        self._map_load_selected()
+
+    def _map_confirm_discard(self) -> bool:
+        resp = QtWidgets.QMessageBox.question(
+            self, "Discard changes?",
+            "This map has unsaved changes. Discard them?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp == QtWidgets.QMessageBox.Yes:
+            return True
+        # Put the dropdown back on the map still being edited, with signals muted
+        # so this handler does not re-enter and ask again.
+        self._map_loading = True
+        idx = self.map_name_combo.findData(self._map_selected)
+        self.map_name_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._map_loading = False
+        return False
+
+    def _map_button_count(self) -> int:
+        """How many button rows to show.
+
+        Prefer what the connected pad reports. With nothing connected, fall back to
+        the highest index the map or the built-in profile mentions, so an existing
+        layout is still fully editable offline instead of showing an empty table.
+        """
+        if self._map_nbuttons > 0:
+            return self._map_nbuttons
+        used = [i for i in self._map_draft.commands.values() if i is not None and i >= 0]
+        used += [i for i in CONTROLLER_PROFILES[self._map_ctype()].buttons.values()]
+        used += list(self._map_draft.names.keys())
+        return max(used or [0]) + 1
+
+    def _map_axis_count(self) -> int:
+        """Axis rows to offer. Same offline fallback logic as the button count:
+        prefer what the device reports, else cover every index already in use."""
+        if self._map_axis_values:
+            return len(self._map_axis_values)
+        prof = CONTROLLER_PROFILES[self._map_ctype()]
+        used = [i for i in self._map_draft.axes.values() if i is not None and i >= 0]
+        used += [prof.roll_axis, prof.pitch_axis, prof.yaw_axis, prof.throttle_axis,
+                 prof.trim_roll_axis, prof.trim_pitch_axis, prof.trim_yaw_axis]
+        return max([i for i in used if i >= 0] or [0]) + 1
+
+    def _map_refresh(self) -> None:
+        """Rebuild both tables from the draft. Cheap enough to do wholesale."""
+        n = self._map_button_count()
+        assigned: Dict[int, List[str]] = {}
+        labels = {c: l for c, l, _ in CONTROLLER_COMMANDS}
+        for cmd, idx in self._map_draft.commands.items():
+            if idx is not None and idx >= 0:
+                assigned.setdefault(idx, []).append(labels.get(cmd, cmd))
+
+        self._map_loading = True
+        self.map_btn_table.setRowCount(n)
+        for i in range(n):
+            num = QtWidgets.QTableWidgetItem(str(i))
+            num.setFlags(num.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.map_btn_table.setItem(i, 0, num)
+            self.map_btn_table.setItem(
+                i, 1, QtWidgets.QTableWidgetItem(self._map_draft.names.get(i, "")))
+            live = QtWidgets.QTableWidgetItem("● pressed" if i in self._map_pressed else "")
+            live.setFlags(live.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.map_btn_table.setItem(i, 2, live)
+            use = QtWidgets.QTableWidgetItem(", ".join(sorted(assigned.get(i, []))) or "—")
+            use.setFlags(use.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.map_btn_table.setItem(i, 3, use)
+        self.map_btn_table.resizeColumnsToContents()
+
+        for cmd, combo in self.map_cmd_combos.items():
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— unmapped —", UNMAPPED)
+            for i in range(n):
+                combo.addItem(self._map_draft.button_label(i), i)
+            cur = self._map_draft.commands.get(cmd, UNMAPPED)
+            idx = combo.findData(cur if cur is not None and cur >= 0 else UNMAPPED)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self.map_cmd_table.resizeColumnsToContents()
+
+        n_axes = self._map_axis_count()
+        for key, _, _, _ in AXIS_CONTROLS:
+            combo = self.map_axis_combos[key]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— none —", UNMAPPED)
+            for i in range(n_axes):
+                combo.addItem(f"axis {i}", i)
+            cur = self._map_draft.axes.get(key, UNMAPPED)
+            at = combo.findData(cur if cur is not None and cur >= 0 else UNMAPPED)
+            combo.setCurrentIndex(at if at >= 0 else 0)
+            combo.blockSignals(False)
+            chk = self.map_axis_invert[key]
+            chk.blockSignals(True)
+            chk.setChecked(bool(self._map_draft.inverted.get(key)))
+            chk.blockSignals(False)
+        self._map_loading = False
+        self._map_refresh_axis_live()
+
+        self._map_refresh_warnings()
+        self._map_update_enabled()
+
+    def _map_refresh_warnings(self) -> None:
+        warns = self._map_draft.warnings()
+        self.map_warn_label.setVisible(bool(warns))
+        if warns:
+            self.map_warn_label.setText("⚠ " + "<br>⚠ ".join(warns))
+
+    def _map_update_enabled(self) -> None:
+        """Arm lock: while the motor is armed, the layout is frozen.
+
+        Reassigning arm_latch or override_latch with a live motor could strand the
+        aircraft in override with no way back, so the whole tab goes read-only
+        rather than trying to allow the 'safe' subset of edits.
+        """
+        locked = self._map_armed
+        self.map_lock_label.setVisible(locked)
+        if locked:
+            self.map_lock_label.setText(
+                "Motor is ARMED — button mapping is locked. Disarm to edit.")
+        self.map_btn_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.NoEditTriggers if locked
+            else QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed)
+        for combo in self.map_cmd_combos.values():
+            combo.setEnabled(not locked)
+        for b in self.map_learn_btns.values():
+            b.setEnabled(not locked)
+        for combo in self.map_axis_combos.values():
+            combo.setEnabled(not locked)
+        for key, chk in self.map_axis_invert.items():
+            # Throttle has no invert: its direction lives in the calibration.
+            chk.setEnabled(not locked and key != "throttle")
+        # Detection asks for full-scale stick movement -- including full throttle
+        # -- so it is gated on disarm like everything else on this tab.
+        for b in self.map_axis_detect_btns.values():
+            b.setEnabled(not locked)
+        for b in (self.map_save_btn, self.map_saveas_btn,
+                  self.map_delete_btn, self.map_revert_btn):
+            b.setEnabled(not locked)
+        self.map_ctype_combo.setEnabled(not locked)
+        self.map_name_combo.setEnabled(not locked)
+        self.map_save_btn.setText("Save *" if self._map_dirty and not locked else "Save")
+
+    # ----- Mapping tab: edits ---------------------------------------------- #
+    def _map_on_name_edited(self, item) -> None:
+        if self._map_loading or item.column() != 1:
+            return
+        idx = item.row()
+        text = item.text().strip()
+        if text:
+            self._map_draft.names[idx] = text
+        else:
+            self._map_draft.names.pop(idx, None)
+        self._map_dirty = True
+        # The label feeds the assignment dropdowns, so they have to be rebuilt.
+        self._map_refresh()
+
+    def _map_on_assign_changed(self, cmd: str) -> None:
+        if self._map_loading:
+            return
+        combo = self.map_cmd_combos[cmd]
+        self._map_draft.commands[cmd] = int(combo.currentData())
+        self._map_dirty = True
+        self._map_refresh()
+
+    def _map_learn(self, cmd: str) -> None:
+        """Arm capture-by-press for one command. Clicking an already-armed row
+        cancels, so the button is its own escape hatch."""
+        if self._map_learn_cmd == cmd:
+            self._map_cancel_learn()
+            return
+        self._map_cancel_learn()
+        self._map_learn_cmd = cmd
+        b = self.map_learn_btns[cmd]
+        b.setChecked(True)
+        b.setText("press…")
+
+    def _map_cancel_learn(self) -> None:
+        cmd = self._map_learn_cmd
+        self._map_learn_cmd = None
+        if cmd and cmd in self.map_learn_btns:
+            b = self.map_learn_btns[cmd]
+            b.setChecked(False)
+            b.setText("Learn")
+
+    def _on_buttons_state(self, payload) -> None:
+        """Worker-thread sample of the controller's discrete inputs.
+
+        Qt marshals this onto the GUI thread for us, which is the reason the worker
+        emits instead of the GUI polling pygame: SDL joystick state belongs to the
+        thread that opened the device.
+        """
+        armed, nbuttons, pressed = payload
+        was_pressed, was_n, was_armed = self._map_pressed, self._map_nbuttons, self._map_armed
+        self._map_pressed, self._map_nbuttons, self._map_armed = pressed, nbuttons, armed
+
+        # Learn resolves on the rising edge only, so holding a switch down does not
+        # keep re-capturing, and a switch already up when you click Learn is ignored
+        # until you actually flip it.
+        if self._map_learn_cmd and not self._map_armed:
+            new = pressed - was_pressed
+            if new:
+                cmd = self._map_learn_cmd
+                self._map_draft.commands[cmd] = min(new)
+                self._map_dirty = True
+                self._map_cancel_learn()
+                self._map_refresh()
+                return
+
+        if pressed != was_pressed or nbuttons != was_n:
+            self._map_refresh()
+        elif armed != was_armed:
+            self._map_update_enabled()
+
+    # ----- Mapping tab: axis detection ------------------------------------- #
+    def _map_on_axis_changed(self, key: str) -> None:
+        if self._map_loading:
+            return
+        self._map_draft.axes[key] = int(self.map_axis_combos[key].currentData())
+        self._map_dirty = True
+        self._map_refresh()
+
+    def _map_on_invert_changed(self, key: str, on: bool) -> None:
+        if self._map_loading:
+            return
+        self._map_draft.inverted[key] = bool(on)
+        self._map_dirty = True
+        self._map_update_enabled()
+
+    def _map_detect_axis(self, key: str) -> None:
+        """Start (or cancel) detect-by-moving for one flight axis."""
+        if self._map_detect and self._map_detect["key"] == key:
+            self._map_cancel_detect("Detection cancelled.")
+            return
+        self._map_cancel_detect()
+        if self._map_armed:
+            # Belt and braces: the buttons are already disabled while armed, but
+            # detecting the throttle means shoving the stick to full, so this one
+            # gets an explicit refusal rather than trusting a widget's state.
+            self.map_axis_status.setText("Cannot detect while the motor is ARMED.")
+            return
+        if not self._map_axis_values:
+            self.map_axis_status.setText(
+                "No controller data. Connect (and enable the controller) first.")
+            self.map_axis_detect_btns[key].setChecked(False)
+            return
+        prompt = {k: p for k, _, p, _ in AXIS_CONTROLS}[key]
+        self._map_detect = {
+            "key": key,
+            "phase": "baseline",
+            "until": time.monotonic() + AXIS_DETECT_BASELINE_S,
+            "baseline": list(self._map_axis_values),
+            "peak": [0.0] * len(self._map_axis_values),
+        }
+        self.map_axis_detect_btns[key].setChecked(True)
+        self.map_axis_detect_btns[key].setText("cancel")
+        self.map_axis_status.setText(f"Hold still — sampling rest position… ({prompt} next)")
+
+    def _map_cancel_detect(self, message: str = "") -> None:
+        if self._map_detect:
+            btn = self.map_axis_detect_btns[self._map_detect["key"]]
+            btn.setChecked(False)
+            btn.setText("Detect")
+        self._map_detect = None
+        if message:
+            self.map_axis_status.setText(message)
+
+    def _on_axes_state(self, payload) -> None:
+        """~25 Hz axis sample from the worker: live readout plus detection."""
+        armed, values = payload
+        self._map_axis_values = values
+        if armed != self._map_armed:
+            self._map_armed = armed
+            if armed:
+                self._map_cancel_detect("Motor armed — detection stopped.")
+            self._map_update_enabled()
+        self._map_refresh_axis_live()
+        if self._map_detect:
+            self._map_detect_step(values)
+
+    def _map_detect_step(self, values: Tuple[float, ...]) -> None:
+        """One sample of the detection state machine.
+
+        Driven by incoming samples rather than a QTimer: if the controller stops
+        reporting, detection simply stops advancing instead of timing out against
+        a clock that keeps running with no data behind it.
+        """
+        st = self._map_detect
+        now = time.monotonic()
+        if len(values) != len(st["baseline"]):
+            self._map_cancel_detect("Controller axis count changed — detection aborted.")
+            return
+
+        if st["phase"] == "baseline":
+            st["baseline"] = list(values)
+            if now >= st["until"]:
+                st["phase"] = "capture"
+                st["until"] = now + AXIS_DETECT_CAPTURE_S
+            return
+
+        # Rank by *peak deviation from rest*, not by crossing a fixed threshold.
+        # This is the lesson already learned in interlink_tester.py: the
+        # InterLink-X throttle and rear knobs rest near an end-stop (~+0.8), so
+        # they can only travel ~0.2 and would never cross a 0.30 threshold. Peak
+        # deviation catches an end-stop axis as readily as a centred one.
+        for i, v in enumerate(values):
+            d = v - st["baseline"][i]
+            if abs(d) > abs(st["peak"][i]):
+                st["peak"][i] = d
+
+        lead = max(range(len(st["peak"])), key=lambda i: abs(st["peak"][i]))
+        remaining = st["until"] - now
+        if remaining > 0:
+            self.map_axis_status.setText(
+                f"Move it now — {remaining:.1f}s  (leading: axis {lead}, "
+                f"deviation {st['peak'][lead]:+.2f})")
+            return
+
+        self._map_detect_finish(st, lead)
+
+    def _map_detect_finish(self, st: dict, lead: int) -> None:
+        key = st["key"]
+        dev = st["peak"][lead]
+        label = {k: l for k, l, _, _ in AXIS_CONTROLS}[key]
+        if abs(dev) < AXIS_DETECT_MIN_DEV:
+            self._map_cancel_detect(
+                f"Barely any movement seen (peak {dev:+.2f}) — nothing assigned for "
+                f"{label}. Centre the sticks, click Detect, then move it fully.")
+            return
+
+        self._map_draft.axes[key] = lead
+        if key == "throttle":
+            # Throttle carries no sign: it is calibrated by raw endpoints, so
+            # direction and non-full-scale travel are captured in one go. Rest is
+            # idle (motor off), the far end of the swing is full.
+            self._map_draft.throttle_idle_raw = round(st["baseline"][lead], 3)
+            self._map_draft.throttle_full_raw = round(st["baseline"][lead] + dev, 3)
+            self._map_draft.axis_signs[key] = 1.0
+            detail = (f"idle {self._map_draft.throttle_idle_raw:+.2f} → "
+                      f"full {self._map_draft.throttle_full_raw:+.2f}")
+        else:
+            # Orient so the gesture the user was asked to make produces the
+            # logical sign this codebase expects (see AXIS_CONTROLS). Note this
+            # does NOT touch `inverted` -- an airframe reversal survives a
+            # re-detect.
+            want = {k: s for k, _, _, s in AXIS_CONTROLS}[key]
+            observed = 1.0 if dev > 0 else -1.0
+            self._map_draft.axis_signs[key] = want * observed
+            detail = f"sign {self._map_draft.axis_signs[key]:+.0f} (peak {dev:+.2f})"
+
+        self._map_dirty = True
+        self._map_cancel_detect()
+        self._map_refresh()
+        self.map_axis_status.setText(f"{label} → axis {lead}, {detail}. Press Save to apply.")
+
+    def _map_refresh_axis_live(self) -> None:
+        """Update just the Live column. Called at 25 Hz, so it deliberately does
+        not go through the full _map_refresh table rebuild."""
+        for key, _, _, _ in AXIS_CONTROLS:
+            idx = self._map_draft.axes.get(key, UNMAPPED)
+            item = self.map_axis_live.get(key)
+            if item is None:
+                continue
+            if idx is None or idx < 0 or idx >= len(self._map_axis_values):
+                item.setText("—")
+            else:
+                item.setText(f"{self._map_axis_values[idx]:+.2f}")
+
+    # ----- Mapping tab: persistence ---------------------------------------- #
+    def _map_commit(self, name: str) -> None:
+        """Write the draft to disk under `name`, mark it active, and push it to a
+        running worker so the change is live without reconnecting."""
+        maps, active = load_controller_maps()
+        self._map_draft.name = name
+        self._map_draft.controller_type = self._map_ctype()
+        maps[name] = self._map_draft
+        active[self._map_ctype()] = name
+        try:
+            save_controller_maps(maps, active)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save failed", f"Could not write {CONTROLLER_MAPS_FILE}:\n{exc}")
+            return
+        self._map_dirty = False
+        # Only push to a live session, and only if it is using this controller
+        # type -- otherwise the edit is for a layout the session is not reading.
+        if self._worker_running and self.worker.config.controller_type == self._map_ctype():
+            self.worker.post("set_controller_map", self._map_draft)
+        self._map_reload_names()
+
+    def _map_save(self) -> None:
+        name = self.map_name_combo.currentData()
+        if name is None:
+            # Nothing to overwrite -- the built-in entry is a placeholder, not a
+            # saved map, so this degrades into Save As rather than silently
+            # inventing a name.
+            self._map_save_as()
+            return
+        self._map_commit(name)
+
+    def _map_save_as(self) -> None:
+        suggested = self._map_draft.name if self.map_name_combo.currentData() else \
+            f"{CONTROLLER_PROFILES[self._map_ctype()].label} custom"
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save button map", "Name for this map:",
+            QtWidgets.QLineEdit.Normal, suggested)
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        maps, _ = load_controller_maps()
+        if name in maps:
+            resp = QtWidgets.QMessageBox.question(
+                self, "Overwrite?", f"A map named '{name}' already exists. Replace it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if resp != QtWidgets.QMessageBox.Yes:
+                return
+        # Save As copies: keep the draft's assignments but under the new identity.
+        self._map_draft = ControllerMap(name=name, controller_type=self._map_ctype(),
+                                    commands=dict(self._map_draft.commands),
+                                    names=dict(self._map_draft.names))
+        self._map_commit(name)
+
+    def _map_delete(self) -> None:
+        name = self.map_name_combo.currentData()
+        if name is None:
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self, "Delete map", f"Delete the saved map '{name}'?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        maps, active = load_controller_maps()
+        maps.pop(name, None)
+        # Deleting the active map falls back to the built-in layout rather than
+        # leaving 'active' pointing at something that no longer exists.
+        if active.get(self._map_ctype()) == name:
+            active.pop(self._map_ctype(), None)
+            if self._worker_running:
+                self.worker.post("set_controller_map", None)
+        try:
+            save_controller_maps(maps, active)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Delete failed", f"Could not write {CONTROLLER_MAPS_FILE}:\n{exc}")
+            return
+        self._map_reload_names()
+
+    def _map_revert(self) -> None:
+        resp = QtWidgets.QMessageBox.question(
+            self, "Revert to built-in",
+            "Load this controller's built-in layout? Saved maps are kept, but "
+            "the controller will use the built-in one until you save again.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        maps, active = load_controller_maps()
+        active.pop(self._map_ctype(), None)
+        try:
+            save_controller_maps(maps, active)
+        except OSError:
+            pass
+        if self._worker_running:
+            self.worker.post("set_controller_map", None)
+        self._map_reload_names()
 
     def _build_flightdata_tab(self) -> QtWidgets.QWidget:
         """Offline flight-log viewer: pick clipped/raw flights from the log folder,
@@ -3329,6 +4412,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_connected_ui(ok)
 
     def _set_connected_ui(self, ok: bool) -> None:
+        # Whether the worker loop is live. Posting to a stopped worker is not
+        # harmless: the command queue survives, so a map posted now would be
+        # applied at the start of the *next* session, overriding whatever was
+        # selected then. The Mapping tab checks this before posting.
+        self._worker_running = ok
         # Setup fields locked while connected (the Save-defaults button stays
         # live, so a session's settings can still be blessed after connecting).
         for wdg in self._setup_bindings().values():
