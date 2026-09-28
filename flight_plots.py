@@ -5,7 +5,7 @@ deflections on one stacked, time-synced figure with major flight events marked.
 A flight's data lives in the five time-aligned CSV streams that share the
 `cf_time_s` clock (see clip_flights.py). This module turns one such set -- either
 a raw session (auto-detecting its flight window) or an already-clipped
-`*_flightN_*` set -- into a matplotlib Figure with three stacked subplots that
+`*_flightN_*` set -- into a matplotlib Figure with stacked subplots that
 share the x (time) axis:
 
   Row 1  Gyro rates (roll/pitch/yaw, deg/s) with the pilot's rate setpoints
@@ -14,9 +14,12 @@ share the x (time) axis:
   Row 3  Control-surface deflections normalised to -1..+1, translated from the
          raw motor commands (Motor.csv motor_m4=aileron, motor_m2=elevator,
          motor_m1=aileron2; centred at 32767), plus throttle (servo_cmd).
+  Row 4  EKF attitude angles (deg), from the est_roll/est_pitch/est_yaw columns
+         appended to Accelerometer.csv. ONLY drawn when the log has them, so
+         older 4-column logs still plot as 3 rows.
 
 Major flight events (arm, disarm, failsafe/connection-loss, PID applied, plus
-derived takeoff/land) are drawn as labelled vertical lines across all three rows.
+derived takeoff/land) are drawn as labelled vertical lines across all rows.
 Events are keyed on host wall-clock time and mapped back onto the cf_time axis
 using the breakpoint anchors embedded in the streams.
 
@@ -105,6 +108,11 @@ class FlightData:
     # Row 2
     acc_t: List[float] = field(default_factory=list)
     acc: Dict[str, List[float]] = field(default_factory=dict)    # x/y/z
+    # Row 4 (EKF attitude, deg). Shares the accelerometer stream's clock: both come
+    # from the same log block. Empty for logs recorded before the attitude columns
+    # were added, which is how build_figure decides whether to draw the row at all.
+    est_t: List[float] = field(default_factory=list)
+    est: Dict[str, List[float]] = field(default_factory=dict)    # roll/pitch/yaw
     # Row 3
     mot_t: List[float] = field(default_factory=list)
     surf: Dict[str, List[float]] = field(default_factory=dict)   # ail/elev/ail2
@@ -151,7 +159,17 @@ def _load_controller(fd: FlightData, prefix: str) -> None:
 
 
 def _load_accel(fd: FlightData, prefix: str) -> None:
+    """Load acc_x/y/z and, when present, the appended EKF attitude columns.
+
+    Columns 4-6 (est_roll/est_pitch/est_yaw, deg) were appended to this stream
+    later, so they are read OPTIONALLY: logs recorded before that change have only
+    4 columns and must still load. A short row is not an error here, which is why
+    the attitude parse gets its own try/except instead of widening the one above --
+    an IndexError from the attitude columns must not discard the acceleration
+    sample that came with it.
+    """
     fd.acc = {"x": [], "y": [], "z": []}
+    fd.est = {"roll": [], "pitch": [], "yaw": []}
     for row in cf._iter_data_rows(f"{prefix}_Accelerometer.csv"):
         try:
             t = float(row[0])
@@ -164,6 +182,14 @@ def _load_accel(fd: FlightData, prefix: str) -> None:
         fd.acc["x"].append(ax)
         fd.acc["y"].append(ay)
         fd.acc["z"].append(az)
+        try:
+            er, ep, ey = float(row[4]), float(row[5]), float(row[6])
+        except (ValueError, IndexError):
+            continue
+        fd.est_t.append(t)
+        fd.est["roll"].append(er)
+        fd.est["pitch"].append(ep)
+        fd.est["yaw"].append(ey)
 
 
 def _deflection(cmd: float) -> float:
@@ -439,9 +465,18 @@ def _draw_events(ax, fd: FlightData, t0: float, label: bool) -> None:
 
 
 def build_figure(fd: FlightData, figsize=(11, 8)) -> Figure:
-    """Build the 3-row stacked, shared-x figure for one flight."""
+    """Build the stacked, shared-x figure for one flight.
+
+    3 rows normally; a 4th EKF-attitude row is added only when the log actually
+    carries attitude data. Making the row conditional rather than always-present
+    keeps every pre-existing log plotting at full height instead of giving it a
+    permanently empty panel.
+    """
+    has_att = bool(fd.est_t) and any(fd.est.get(a) for a in ("roll", "pitch", "yaw"))
     fig = Figure(figsize=figsize, constrained_layout=True)
-    ax1, ax2, ax3 = fig.subplots(3, 1, sharex=True)
+    rows = fig.subplots(4 if has_att else 3, 1, sharex=True)
+    ax1, ax2, ax3 = rows[0], rows[1], rows[2]
+    ax4 = rows[3] if has_att else None
     t0 = _t0(fd)
 
     # Row 1: gyro + setpoints
@@ -484,20 +519,34 @@ def build_figure(fd: FlightData, figsize=(11, 8)) -> Figure:
                  linestyle="-", alpha=0.8, label="throttle")
     ax3.set_ylabel("deflection (-1..1)")
     ax3.set_ylim(-1.1, 1.1)
-    ax3.set_xlabel("time in flight (s)")
     ax3.legend(fontsize=6, ncol=4, loc="upper right")
     ax3.grid(True, alpha=0.3)
 
+    # Row 4 (optional): EKF attitude angles. Same colour per axis as row 1 so a
+    # roll rate and a roll angle read as the same channel across rows.
+    if ax4 is not None:
+        for axis in ("roll", "pitch", "yaw"):
+            if fd.est.get(axis):
+                xs = [t - t0 for t in fd.est_t]
+                ax4.plot(xs, fd.est[axis], color=gcol[axis], linewidth=0.9,
+                         label=f"att {axis}")
+        ax4.set_ylabel("attitude (deg)")
+        ax4.legend(fontsize=6, ncol=3, loc="upper right")
+        ax4.grid(True, alpha=0.3)
+
+    # x-label belongs to whichever row is last, since sharex hides the others'
+    # tick labels. Hardcoding it on ax3 would leave it stranded mid-figure once
+    # the attitude row exists.
+    rows[-1].set_xlabel("time in flight (s)")
+
     # Shade detected clip windows behind the traces (full-session plot only);
     # label f1, f2, ... once on the bottom row.
-    _draw_clip_windows(ax1, fd, t0, label=False)
-    _draw_clip_windows(ax2, fd, t0, label=False)
-    _draw_clip_windows(ax3, fd, t0, label=True)
+    for ax in rows:
+        _draw_clip_windows(ax, fd, t0, label=ax is rows[-1])
 
     # Event lines across all rows; label only on the top row.
-    _draw_events(ax1, fd, t0, label=True)
-    _draw_events(ax2, fd, t0, label=False)
-    _draw_events(ax3, fd, t0, label=False)
+    for ax in rows:
+        _draw_events(ax, fd, t0, label=ax is rows[0])
 
     fig.suptitle(fd.name, fontsize=10)
     return fig

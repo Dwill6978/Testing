@@ -218,7 +218,14 @@ def clipped_day_dir(session_name: str) -> str:
     return day_dir
 
 
-CONNECTION_WATCHDOG_TIMEOUT_S = 1.0
+# Disarm if the Connection log block goes silent this long. MUST stay several times
+# the Connection log period, or a single dropped packet trips a spurious failsafe:
+# this was 1.0 s while the saved period was 1000 ms, i.e. ZERO margin, and 54 of 204
+# recorded sessions logged a CONNECTION_TELEMETRY_TIMEOUT disarm -- many of which
+# were almost certainly this, not real link loss. At 3.0 s against a 500 ms period
+# the watchdog needs 6 consecutive misses to fire, so it still catches a genuinely
+# dead link but tolerates ordinary radio jitter.
+CONNECTION_WATCHDOG_TIMEOUT_S = 3.0
 DEFAULT_PLOT_WINDOW_S = 20.0  # how much history each live plot shows
 
 
@@ -321,7 +328,12 @@ class CsvLogBundle:
         self.connection.writerow(["cf_time_s", "rssi", "vbat"])
 
         self.accelerometer.writerow(["# schema_version", CSV_SCHEMA_VERSION, "dataset", "accelerometer"])
-        self.accelerometer.writerow(["cf_time_s", "acc_x", "acc_y", "acc_z"])
+        # EKF attitude (deg) is APPENDED after acc_z so existing readers that index
+        # acc_x at column 1 and acc_z at column 3 -- clip_flights and flight_plots --
+        # keep working unchanged on both old and new logs. Same convention as the
+        # motor row above.
+        self.accelerometer.writerow(["cf_time_s", "acc_x", "acc_y", "acc_z",
+                                     "est_roll", "est_pitch", "est_yaw"])
 
         self.event.writerow(["# schema_version", CSV_SCHEMA_VERSION, "dataset", "events"])
         self.event.writerow(["host_time_iso", "event", "value_1", "value_2", "value_3"])
@@ -392,6 +404,9 @@ class PlotBuffers:
         self.t_motor, self.motor1, self.motor2, self.motor3, self.motor4, self.thrust = (d("motor") for _ in range(6))
         self.t_conn, self.rssi = d("connection"), d("connection")
         self.t_acc, self.accx, self.accy, self.accz = (d("accelerometer") for _ in range(4))
+        # EKF attitude angles (deg). Same block/period as the accelerometer, so the
+        # same maxlen keeps them index-aligned with t_acc.
+        self.estroll, self.estpitch, self.estyaw = (d("accelerometer") for _ in range(3))
 
     def configure(self, periods_ms: Dict[str, int], window_s: Optional[float] = None) -> None:
         """Resize the buffers for new log periods. Call before telemetry starts."""
@@ -417,10 +432,15 @@ class PlotBuffers:
         with self._lock:
             self.t_conn.append(ts); self.rssi.append(rssi)
 
-    def add_accel(self, ts, ax, ay, az):
+    def add_accel(self, ts, ax, ay, az, er=None, ep=None, ey=None):
+        # EKF attitude rides the same log block as acceleration (one CRTP packet,
+        # same timestamp), so it shares t_acc rather than carrying its own clock.
+        # The est_* args default to None so a caller that predates the attitude
+        # subscription still works.
         with self._lock:
             self.t_acc.append(ts)
             self.accx.append(ax); self.accy.append(ay); self.accz.append(az)
+            self.estroll.append(er); self.estpitch.append(ep); self.estyaw.append(ey)
 
     def snapshot(self) -> Dict[str, list]:
         with self._lock:
@@ -428,7 +448,7 @@ class PlotBuffers:
                 "t_ctrl", "gyroroll", "gyropitch", "gyroyaw", "setroll", "setpitch", "setyaw",
                 "t_motor", "motor1", "motor2", "motor3", "motor4", "thrust",
                 "t_conn", "rssi",
-                "t_acc", "accx", "accy", "accz",
+                "t_acc", "accx", "accy", "accz", "estroll", "estpitch", "estyaw",
             )}
 
 
@@ -446,17 +466,41 @@ class PlotCanvas(FigureCanvas):
         (self.line_gyroroll,) = self.ax.plot([], [], label="Roll Rate", color="blue")
         (self.line_setroll,) = self.ax.plot([], [], label="Roll Setpoint", color="red")
         self.ax.set_ylim(-38, 38); self.ax.set_title("Roll")
-        self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("deg/s"); self.ax.legend()
+        self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("deg/s")
 
         (self.line_gyropitch,) = self.ax2.plot([], [], label="Pitch Rate", color="blue")
         (self.line_setpitch,) = self.ax2.plot([], [], label="Pitch Setpoint", color="red")
         self.ax2.set_ylim(-38, 38); self.ax2.set_title("Pitch")
-        self.ax2.set_xlabel("Time (s)"); self.ax2.set_ylabel("deg/s"); self.ax2.legend()
+        self.ax2.set_xlabel("Time (s)"); self.ax2.set_ylabel("deg/s")
 
         (self.line_gyroyaw,) = self.ax3.plot([], [], label="Yaw Rate", color="blue")
         (self.line_setyaw,) = self.ax3.plot([], [], label="Yaw Setpoint", color="red")
         self.ax3.set_ylim(-38, 38); self.ax3.set_title("Yaw")
-        self.ax3.set_xlabel("Time (s)"); self.ax3.set_ylabel("deg/s"); self.ax3.legend()
+        self.ax3.set_xlabel("Time (s)"); self.ax3.set_ylabel("deg/s")
+
+        # EKF attitude ANGLE on a twin y-axis of the matching rate plot. The 2x3
+        # grid was already full, so rather than shrink all six plots to make a
+        # seventh cell, each angle goes on the subplot that already shows that
+        # axis' rate -- they are the integral/derivative of each other, so reading
+        # them together is what you actually want in flight. Separate y-axis
+        # because the units differ (deg/s vs deg) and the ranges differ by ~5x;
+        # sharing one axis would squash the rate traces flat.
+        self.attitude_axes = {}
+        self.attitude_lines = {}
+        for key, base in (("roll", self.ax), ("pitch", self.ax2), ("yaw", self.ax3)):
+            twin = base.twinx()
+            (line,) = twin.plot([], [], label=f"{key.capitalize()} Angle",
+                                color="darkgreen", linestyle="--", linewidth=1.0)
+            twin.set_ylabel("deg", color="darkgreen")
+            twin.tick_params(axis="y", labelcolor="darkgreen", labelsize=8)
+            self.attitude_axes[key] = twin
+            self.attitude_lines[key] = line
+            # One legend per subplot covering BOTH axes: twinx draws a second,
+            # overlapping legend otherwise, and the angle trace would be missing
+            # from the rate axis' legend entirely.
+            handles = base.get_lines() + [line]
+            base.legend(handles=handles, labels=[h.get_label() for h in handles],
+                        fontsize=6, loc="upper right")
 
         # One trace per motor channel; its label/colour/visibility follow the
         # configured servo->surface map (set via set_surface_map()).
@@ -505,6 +549,18 @@ class PlotCanvas(FigureCanvas):
         self.line_accx.set_data(s["t_acc"], s["accx"])
         self.line_accy.set_data(s["t_acc"], s["accy"])
         self.line_accz.set_data(s["t_acc"], s["accz"])
+
+        # EKF attitude. Samples logged before the attitude subscription existed are
+        # None, so drop those pairs rather than handing None to matplotlib (which
+        # would raise on autoscale). Filtering here also means a mid-session
+        # resubscribe can't misalign the angle traces from their timestamps.
+        for key, line in self.attitude_lines.items():
+            pairs = [(t, v) for t, v in zip(s["t_acc"], s[f"est{key}"]) if v is not None]
+            line.set_data([t for t, _ in pairs], [v for _, v in pairs])
+
+        for twin in self.attitude_axes.values():
+            twin.relim()
+            twin.autoscale(enable=True, axis="both", tight=False)
 
         for axis in (self.ax, self.ax2, self.ax3, self.ax5, self.ax6):
             axis.relim()
@@ -562,7 +618,8 @@ class SessionConfig:
     period_controller_ms: int = 50
     period_motor_ms: int = 50
     period_connection_ms: int = 50
-    period_accelerometer_ms: int = 15
+    # 20 ms = 50 Hz. This block carries acc + EKF attitude (6 vars, one packet).
+    period_accelerometer_ms: int = 20
     plot_window_s: float = DEFAULT_PLOT_WINDOW_S
     gains: PidGains = field(default_factory=PidGains)
 
@@ -1473,8 +1530,18 @@ class GliderWorker(QtCore.QObject):
         lg_connection.add_variable("radio.rssi", "uint8_t")
         lg_connection.add_variable("pm.vbat", "float")
 
+        # This block carries the EKF attitude estimate alongside raw acceleration.
+        # They share one block deliberately: the firmware sends ONE CRTP packet per
+        # block per period regardless of payload (log.c LOG_MAX_LEN = 26), so extra
+        # variables in an existing block cost zero extra radio packets while a new
+        # block would cost a full packet per period. 3 floats (acc) + 3 floats
+        # (attitude) = 24 of the 26 available bytes, so this block is now FULL --
+        # adding a 7th variable here will fail with E2BIG in the firmware.
+        # stateEstimate.* is the estimator output in DEGREES (note: its pitch is
+        # inverted, legacy CF2 body frame), distinct from controller.*Rate.
         lg_accel = LogConfig(name="Accelerometer", period_in_ms=self.config.period_accelerometer_ms)
-        for v in ("acc.x", "acc.y", "acc.z"):
+        for v in ("acc.x", "acc.y", "acc.z",
+                  "stateEstimate.roll", "stateEstimate.pitch", "stateEstimate.yaw"):
             lg_accel.add_variable(v, "float")
 
         self.log_configs = {
@@ -1566,8 +1633,10 @@ class GliderWorker(QtCore.QObject):
     def _on_accel_log(self, timestamp, data, _logconf):
         ts = timestamp / 1000.0
         ax = float(data["acc.x"]); ay = float(data["acc.y"]); az = float(data["acc.z"])
-        self.buffers.add_accel(ts, ax, ay, az)
-        self.logs.accelerometer.writerow([ts, ax, ay, az])
+        er = float(data["stateEstimate.roll"]); ep = float(data["stateEstimate.pitch"])
+        ey = float(data["stateEstimate.yaw"])
+        self.buffers.add_accel(ts, ax, ay, az, er, ep, ey)
+        self.logs.accelerometer.writerow([ts, ax, ay, az, er, ep, ey])
 
     # ----- connection failsafe --------------------------------------------- #
     def _bind_connection_callbacks(self) -> None:
@@ -3751,6 +3820,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Accel (g)", ("acc x", "acc y", "acc z")),
             ("Surfaces / throttle", (
                 "aileron", "elevator", "aileron2", "rudder", "throttle")),
+            # Only present on logs recorded after the EKF attitude columns were
+            # added; the checkboxes are harmless on older logs because
+            # _fd_apply_series_to_fig matches on label and simply finds no such line.
+            ("Attitude (deg)", ("att roll", "att pitch", "att yaw")),
         )
         self.fd_series_checks: Dict[str, QtWidgets.QCheckBox] = {}
         for col, (group_name, labels) in enumerate(series_groups):

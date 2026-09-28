@@ -15,7 +15,7 @@
   "log_accelerometer": true,
   "period_controller_ms": 10,
   "period_motor_ms": 10,
-  "period_connection_ms": 1000,
-  "period_accelerometer_ms": 100,
+  "period_connection_ms": 500,
+  "period_accelerometer_ms": 20,
   "plot_window_s": 20.0
 }
