@@ -10,24 +10,30 @@ copies containing only those windows -- one set of files per detected flight.
 
 Each flight is one hand-launch glide, bracketed by a pair of OPPOSITE-direction
 acc_x jolts with the flight in between. Detection uses only the accelerometer:
-  1. LAUNCH = a BIG impulse in the X acceleration (Accelerometer.csv acc_x) -- at
-     least ~3 g. On the ground |acc_x| ~ 0.05 g, and handling/walking only reaches
-     ~0.9 g, so a >= ACC_X_SPIKE jolt reliably means a hand-launch throw. The brief
-     multi-sample "ringing" of one throw is grouped into a single impulse event via
-     SPIKE_CLUSTER_S, whose SIGN is taken from its largest-magnitude sample. A
-     flight OPENS at a launch impulse.
+  1. LAUNCH = an impulse in the X acceleration (Accelerometer.csv acc_x). On the
+     ground |acc_x| median ~0.1 g with a measured maximum of 1.155 g across a full
+     session; real throws run ~2.3-24 g. A >= ACC_X_SPIKE (1.5 g) jolt is therefore
+     taken as a candidate hand-launch. The brief multi-sample "ringing" of one throw
+     is grouped into a single impulse event via SPIKE_CLUSTER_S, whose SIGN and PEAK
+     come from its largest-magnitude sample. A flight OPENS at that PEAK -- the
+     instant of the throw -- not at the end of the cluster, which drifts later as the
+     gate is lowered and would truncate the start of the glide.
   2. LANDING = the airframe abruptly going still. The flight CLOSES at the first
      REST_MIN_S stretch of near-constant acc_z (std < REST_STD) after the launch --
      the aircraft down and waiting to be recovered. On the ground acc_z is
      rock-steady at ~1 g (std ~0.001); in flight it wanders far more, so the abrupt
      drop to steady readings cleanly marks touchdown and pins an accurate duration.
-     The launch..landing span is accepted as a flight if it was confirmed EITHER by
-     a >= LAND_SPIKE opposite-direction decel (a hard landing brakes the airframe
-     with an acc_x jolt opposite the throw; real logs show ~2 g, hence
-     LAND_SPIKE < ACC_X_SPIKE) OR by being clearly airborne (acc_z std over the span
-     >= AIRBORNE_STD). The airborne branch catches soft/belly landings whose decel
-     is too gentle to reach LAND_SPIKE but which were unmistakably in the air.
-  3. The next launch is the first strong impulse AFTER that landing, so several
+     The launch..landing span is accepted as a flight if ANY ONE of three
+     independent pieces of evidence holds: a >= LAND_SPIKE opposite-direction decel
+     (a hard landing brakes the airframe with an acc_x jolt opposite the throw; real
+     logs show ~2 g), OR a clearly-airborne span (acc_z std >= AIRBORNE_STD), OR a
+     launch peak >= LAUNCH_CONFIDENT (too strong to be anything but a throw). The
+     airborne branch catches soft/belly landings too gentle to reach LAND_SPIKE; the
+     strong-launch branch catches the gentle-throw/calm-glide/soft-landing case where
+     no downstream feature clears its bar. Note acc_z does NOT cleanly separate
+     flight from ground (the distributions overlap) -- the acc_x impulse does, which
+     is why enumeration is driven by acc_x and acc_z only ever confirms.
+  3. The next launch is the first candidate impulse AFTER that landing, so several
      separate throws in one session become several distinct flights, and a
      mid-flight bump (not followed by rest) never splits one glide. A launch that
      never reaches rest before the log ends is an incomplete glide (logging dropped
@@ -36,7 +42,11 @@ acc_x jolts with the flight in between. Detection uses only the accelerometer:
      airborne) and to last >= MIN_FLIGHT_S.
 
 Gyro and throttle are not used. Sessions without a >= ACC_X_SPIKE impulse contain
-no detected flight. All thresholds are constants below.
+no detected flight. All thresholds are constants below. Note the deliberate split
+between an ENUMERATION threshold (ACC_X_SPIKE, set low -- a flight it misses can
+never be recovered) and CONFIRMATION thresholds (LAUNCH_CONFIDENT / LAND_SPIKE /
+AIRBORNE_STD, set high -- they only decide whether an already-found candidate is
+kept).
 
 Originals are never modified: clipped files are written to an output folder
 (default ./clipped/).
@@ -57,9 +67,28 @@ from typing import Dict, List, Optional, Tuple
 # --------------------------------------------------------------------------- #
 # Detection tuning (values chosen from the bench-vs-flight gap in real logs)
 # --------------------------------------------------------------------------- #
-# LAUNCH = a BIG X-acceleration impulse (the hand-throw). Ground/handling/walking
-# tops out ~0.9 g, real launch throws hit 4-24 g, so 3 g cleanly marks a launch.
-ACC_X_SPIKE = 3.0   # g, |acc_x| jolt strong enough to be a launch throw
+# LAUNCH = an X-acceleration impulse (the hand-throw). This is the ENUMERATION gate:
+# it decides which jolts are even considered as candidate launches, and a flight the
+# gate misses can never be recovered downstream. It is therefore set just above the
+# ground/handling ceiling rather than at a "confident launch" level.
+#
+# Measured over a full 10-glide session (11474 samples, 92% of them ground time):
+# ground |acc_x| median 0.10, p99 0.71, p99.9 0.88, MAX 1.155 -- zero ground samples
+# reach 1.2. Real launch throws in that same session ran 2.35 to 4.11 g. 1.5 g sits
+# in the empty gap between the two, with ~30% headroom over the worst ground sample.
+#
+# This was 3.0, which is why 4 of those 10 glides were never detected: their throws
+# peaked at 2.35 / 2.71 / 2.75 / 2.87 g -- real launches, but gentle ones. Going
+# below ~1.5 is NOT safe: at 1.2 the detector starts emitting 17-62 s "flights",
+# which are bench handling, not glides (a real glide here is 3-16 s).
+ACC_X_SPIKE = 1.5   # g, |acc_x| jolt strong enough to be a candidate launch throw
+
+# A launch this strong is self-evidently a throw and confirms a flight on its own
+# (see _detect_windows). Separating this from ACC_X_SPIKE is the point: enumeration
+# needs a LOW bar so no flight is lost, confirmation needs a HIGH bar so nothing
+# spurious is kept. 3.0 is the value ACC_X_SPIKE itself used to hold, and it is
+# ~2.6x the measured ground maximum of 1.155 g.
+LAUNCH_CONFIDENT = 3.0  # g, launch impulse strong enough to confirm a flight alone
 
 # One throw rings for a few samples; spikes within this gap are one impulse event
 # (so a single launch isn't counted as several takeoffs).
@@ -68,9 +97,11 @@ SPIKE_CLUSTER_S = 2.0
 # LANDING confirmation = an OPPOSITE-direction acc_x jolt (the airframe
 # decelerating as it hits) just before it comes to rest. These are softer and more
 # variable than the throw -- real logs show landing decels of only ~2 g -- so they
-# use a lower threshold than a launch. Still far above the ~0.9 g of flight/walking
-# noise, so it doesn't false-trigger. (A launch is any jolt >= ACC_X_SPIKE; a
-# landing is a >= LAND_SPIKE jolt of the sign OPPOSITE the launch.)
+# use a lower threshold than a confident launch (LAND_SPIKE < LAUNCH_CONFIDENT).
+# Still above the 1.155 g measured ground/handling ceiling, so it doesn't
+# false-trigger. (A candidate launch is any jolt >= ACC_X_SPIKE; a landing is a
+# >= LAND_SPIKE jolt of the sign OPPOSITE the launch. This only ever CONFIRMS a span
+# that a launch already opened, so it does not enumerate anything by itself.)
 LAND_SPIKE = 1.5    # g, min opposite-direction |acc_x| decel to confirm a landing
 
 # A launch..landing span is only a real flight if its Z acceleration is NOT
@@ -79,13 +110,19 @@ LAND_SPIKE = 1.5    # g, min opposite-direction |acc_x| decel to confirm a landi
 # airborne -> dropped.
 Z_CONST_STD = 0.02  # g, minimum acc_z std over a span for it to count as flight
 
-# A flight is confirmed by EITHER a hard opposite-direction landing decel
-# (>= LAND_SPIKE, below) OR a clearly-airborne span. This is the airborne test: a
-# span whose acc_z std exceeds this was unmistakably in the air (real flights show
-# 0.4-1.6 g here; ground is ~0.001 g), so it counts as a flight even when the
-# landing was too soft to produce a LAND_SPIKE decel (a belly/grass landing). Set
-# well above ground/handling noise but below the softest real flight so soft
-# landings are caught without false-triggering on bench handling.
+# One of the three flight-confirmation tests: a span whose acc_z std exceeds this
+# was dynamic enough to call airborne, so it counts as a flight even when the landing
+# was too soft to produce a LAND_SPIKE decel (a belly/grass landing).
+#
+# IMPORTANT -- do not treat this as a clean separator and do not try to tune it
+# lower. Measured on the same session: 5 s ground windows reached an acc_z std of
+# 0.3397 while the weakest real flight span was 0.237. The two classes OVERLAP, and
+# 0.30 sits inside the overlap; every other acc_z statistic overlaps too (window
+# range: ground 1.37 vs flight 1.03; mean|z-1|: ground 0.60 vs flight 0.19). So
+# acc_z alone cannot decide flight-vs-ground here. That is exactly why this is one
+# branch of a three-way OR and not the primary test: the acc_x launch impulse is the
+# feature that actually separates the classes (ground max 1.155 g, weakest real
+# launch 2.35 g). Lowering this value buys false positives, not recall.
 AIRBORNE_STD = 0.30  # g, acc_z std above which a span counts as airborne on its own
 
 # The landing is pinned by the airframe going still right after touchdown (sitting
@@ -241,10 +278,17 @@ def _build_activity(prefix: str) -> List[Sample]:
     return out
 
 
-def _impulse_events(samples: List[Sample]) -> List[Tuple[float, float, int]]:
-    """Group samples with |acc_x| >= ACC_X_SPIKE into (start, end, sign) impulse
-    events, merging the multi-sample ring of one throw (spikes within
-    SPIKE_CLUSTER_S). ``sign`` is +1/-1 for the whole cluster.
+def _impulse_events(samples: List[Sample]) -> List[Tuple[float, float, int, float, float]]:
+    """Group samples with |acc_x| >= ACC_X_SPIKE into
+    (start, end, sign, peak_t, peak_abs) impulse events, merging the multi-sample
+    ring of one throw (spikes within SPIKE_CLUSTER_S). ``sign`` is +1/-1 for the
+    whole cluster; ``peak_t``/``peak_abs`` locate its largest-magnitude sample.
+
+    The peak is reported because the flight must be anchored to it, NOT to the
+    cluster end -- see _detect_windows. The cluster end drifts later as
+    ACC_X_SPIKE is lowered (weaker samples on either side of the throw, and
+    same-sign bumps in the first moments of flight, get absorbed), so anchoring on
+    it would make a flight appear to shrink purely because the gate changed.
 
     Only spikes of the SAME sign are merged: the ring of one throw is all one
     direction, whereas a launch and its landing deceleration point OPPOSITE ways.
@@ -252,7 +296,7 @@ def _impulse_events(samples: List[Sample]) -> List[Tuple[float, float, int]]:
     launch (+) and landing (-) spikes can fall within SPIKE_CLUSTER_S of each other
     -- still yields two separate events (launch then landing) instead of being
     collapsed into one, which would hide the flight."""
-    events: List[List[float]] = []   # [start, end, peak_abs, peak_signed, sign]
+    events: List[List[float]] = []   # [start, end, peak_abs, peak_t, sign]
     for s in samples:
         if abs(s.ax) < ACC_X_SPIKE:
             continue
@@ -262,10 +306,10 @@ def _impulse_events(samples: List[Sample]) -> List[Tuple[float, float, int]]:
             events[-1][1] = s.t
             if abs(s.ax) > events[-1][2]:
                 events[-1][2] = abs(s.ax)
-                events[-1][3] = s.ax
+                events[-1][3] = s.t
         else:
-            events.append([s.t, s.t, abs(s.ax), s.ax, cur_sign])
-    return [(a, b, sg) for a, b, _, _, sg in events]
+            events.append([s.t, s.t, abs(s.ax), s.t, cur_sign])
+    return [(a, b, sg, pt, pk) for a, b, pk, pt, sg in events]
 
 
 def _zstd(samples: List[Sample], t0: float, t1: float) -> float:
@@ -339,10 +383,17 @@ def _detect_windows(samples: List[Sample]) -> List[Tuple[float, float]]:
     session_end = samples[-1].t
     windows = []
     launch_ok_from = samples[0].t   # earliest time an impulse can count as a launch
-    for ev_start, ev_end, sign in events:
+    for ev_start, ev_end, sign, peak_t, peak_abs in events:
         if ev_start < launch_ok_from:
             continue                # inside a prior flight: not a new launch
-        a = ev_end                  # launch: the glide opens here
+        # The glide opens at the PEAK of the impulse -- the instant of the throw --
+        # not at the end of the cluster. ACC_X_SPIKE sits low enough to catch gentle
+        # throws, which means a cluster also swallows the run-up ramp and any
+        # same-sign bump in the first second of flight, so its end can land well
+        # past the actual release. Anchoring there truncates the front of the glide
+        # and can push a short one under MIN_FLIGHT_S. The peak does not move as the
+        # gate changes, so this keeps detection stable against tuning.
+        a = peak_t
         # Landing = where the airframe first settles into rest after the launch.
         b = _rest_onset_after(samples, a, session_end)
         if b is None:
@@ -350,16 +401,21 @@ def _detect_windows(samples: List[Sample]) -> List[Tuple[float, float]]:
         launch_ok_from = b          # impulses before the landing aren't new launches
         if b - a < MIN_FLIGHT_S:
             continue
-        # Confirm a real flight by EITHER a hard opposite-direction decel at
-        # touchdown (a firm landing) OR a clearly-airborne span (acc_z varying far
-        # more than the near-constant ground reading). The airborne branch rescues
-        # soft/belly landings whose decel stays below LAND_SPIKE but which were
-        # plainly in the air. The final Z_CONST_STD gate still rejects a constant-Z
-        # span reached only via a hard decel (never actually airborne).
+        # Confirm a real flight by ANY ONE of three independent pieces of evidence:
+        #   - a hard opposite-direction decel at touchdown (a firm landing);
+        #   - a clearly-airborne span (acc_z varying far more than ground);
+        #   - a launch impulse too strong to be anything but a throw.
+        # The airborne branch rescues soft/belly landings whose decel stays below
+        # LAND_SPIKE. The strong-launch branch rescues the remaining case: a gentle
+        # throw, a calm glide and a soft landing, where no single downstream feature
+        # clears its bar even though the throw itself was unmistakable. The final
+        # Z_CONST_STD gate still rejects a constant-Z span (never actually airborne)
+        # no matter which branch admitted it.
         zst = _zstd(samples, a, b)
         hard_landing = _opposite_decel(samples, a, b, sign) >= LAND_SPIKE
         airborne = zst >= AIRBORNE_STD
-        if (hard_landing or airborne) and zst >= Z_CONST_STD:
+        strong_launch = peak_abs >= LAUNCH_CONFIDENT
+        if (hard_landing or airborne or strong_launch) and zst >= Z_CONST_STD:
             windows.append((a - EDGE_PAD_S, b + EDGE_PAD_S))
     return windows
 
