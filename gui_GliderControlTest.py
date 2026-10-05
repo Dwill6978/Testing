@@ -132,6 +132,23 @@ OVERRIDE_WRITE_INTERVAL = 1.0 / 60.0
 # firmware (manualMotorType decoder + stabilizer apply). See crtp_commander_generic.c.
 MANUAL_MOTOR_SETPOINT_TYPE = 11
 GENERIC_SETPOINT_CHANNEL = 0
+# Streamed propulsion throttle for NORMAL (non-override) flight. Rides channel 1
+# of the same port -- the "meta command" channel -- NOT channel 0 next to the
+# manualMotor packet. Channel 0 is the setpoint channel: the firmware memsets the
+# setpoint_t and pushes it to the commander for every packet that arrives there,
+# so a throttle packet on channel 0 would overwrite the rate setpoint with zeros.
+# Interleaved with this GUI's own ~100 Hz rate stream, every other command the
+# controller saw would be a zero. Channel 1 does not touch the setpoint at all,
+# which is correct: on a fixed wing the ESC is a separate actuator from the
+# surfaces, not a component of the attitude command. See propulsionSetDecoder in
+# crtp_commander.c. Requires the modded firmware.
+META_COMMAND_CHANNEL = 1
+META_PROPULSION_TYPE = 1
+# Default the propulsion throttle to the streamed path. The servo.servoAngle
+# param path is kept switchable (Control tab) so the two can be compared on one
+# flight by logging servo.angle against servo_cmd; it is the fallback for stock
+# firmware, which has no propulsion meta-command decoder.
+PROPULSION_FAST_DEFAULT = True
 # Neutral center for the servo trims (matches the firmware defaults).
 SERVO_TRIM_CENTER = 32767
 # Per-surface trim axis -> firmware param name (stabilizer.trim{Roll,Pitch,Yaw}).
@@ -1542,6 +1559,10 @@ class GliderWorker(QtCore.QObject):
         self._knob_caught: Dict[str, bool] = {}
         self._knob_catch_sign: Dict[str, float] = {}
         # ----- maneuver injection ----------------------------------------- #
+        # Propulsion throttle route for normal flight: True = streamed
+        # meta-command (fast, needs the modded firmware), False = servo.servoAngle
+        # param writes (slow, works on stock). Toggled from the Control tab.
+        self.propulsion_fast = PROPULSION_FAST_DEFAULT
         self.injector = ManeuverInjector()
         self.injector.set_library(load_maneuvers())
         # Last injection actually commanded, body axes deg/s. Written here on the
@@ -2203,6 +2224,15 @@ class GliderWorker(QtCore.QObject):
                 self.commander.send_stop_setpoint()
         except Exception:
             pass
+        # Cut the ESC on the streamed route too, and FIRST: it is the fast one, so
+        # it is the one that can still be carrying throttle. Letting the firmware's
+        # fwProp.timeoutMs expire would also stop the motor, but only after the
+        # timeout -- an explicit zero stops it on the next control cycle. Sent
+        # unconditionally rather than under `if self.propulsion_fast` so that
+        # flipping the route mid-flight cannot leave a stale streamed command as
+        # the freshest thing the firmware has seen.
+        self._send_propulsion_packet(0)
+        self.last_servo_value = 0
         try:
             if self.cf is not None:
                 self.cf.param.set_value("motorPowerSet.enable", "0")
@@ -2457,6 +2487,22 @@ class GliderWorker(QtCore.QObject):
             self.injector.advance = bool(payload)
         elif action == "inject_stick_abort":
             self._inj_stick_abort = bool(payload)
+        elif action == "propulsion_fast":
+            want = bool(payload)
+            if want != self.propulsion_fast:
+                # Zero the route being left behind before switching, so a stale
+                # command on it cannot be what the firmware falls back to.
+                if self.propulsion_fast:
+                    self._send_propulsion_packet(0)
+                else:
+                    self._set_param_if_changed("servo.servoAngle", 0)
+                self.last_servo_value = 0
+                self._last_throttle_write = None
+                self.propulsion_fast = want
+                route = "streamed packet" if want else "servoAngle param"
+                if self.logs is not None:
+                    self.logs.write_event("PROPULSION_ROUTE", route)
+                self._log(f"Propulsion throttle route: {route}\n")
         elif action == "inject_arm":
             self.injector.set_armed(bool(payload), time.monotonic())
             self._drain_injector_events()
@@ -2608,6 +2654,28 @@ class GliderWorker(QtCore.QObject):
         except Exception:
             pass
 
+    def _send_propulsion_packet(self, esc: int) -> None:
+        """Stream one propulsion (ESC) throttle command on the meta-command
+        channel. Matches propulsionSetPacket in the firmware: one type byte then a
+        single little-endian uint16 (0..UINT16_MAX).
+
+        Fire-and-forget, like the rate setpoints and unlike a param write, so
+        this can be called every control-loop tick without building a backlog.
+        That is the whole point: the surfaces always had a streaming path and the
+        ESC did not.
+        """
+        if self.cf is None:
+            return
+        pk = CRTPPacket()
+        pk.port = CRTPPort.COMMANDER_GENERIC
+        pk.channel = META_COMMAND_CHANNEL
+        pk.data = struct.pack("<BH", META_PROPULSION_TYPE,
+                              int(clamp(esc, 0, MAX_MOTOR_CMD)))
+        try:
+            self.cf.send_packet(pk)
+        except Exception:
+            pass
+
     def _set_param_if_changed(self, name: str, value: int) -> None:
         value = int(value)
         if self._last_sent.get(name) != value:
@@ -2644,6 +2712,22 @@ class GliderWorker(QtCore.QObject):
     def _set_bl_motor_throttle(self, throttle: float) -> None:
         """Drive the propulsion ESC toward ``throttle`` (0..1), non-blocking.
 
+        Two routes, selected by self.propulsion_fast:
+
+        FAST (default) -- stream a propulsion meta-command every tick. The
+        firmware applies it inside the stabilizer loop via servoSetAngleFast(),
+        so the command reaches the ESC timer on the next control cycle. No slew
+        limiting and no write coalescing here, because both of those exist only
+        to protect the param channel: a fire-and-forget packet cannot build a
+        backlog, and rate-limiting the host would just add lag back on top of
+        hardware that no longer needs it. The ESC's own ramp is the authority on
+        how fast the motor may spool.
+
+        PARAM (fallback) -- the original servo.servoAngle param write, kept for
+        stock firmware (which has no propulsion decoder) and so the two paths can
+        be compared on a single flight. Everything below about slewing and
+        coalescing applies to THIS route only.
+
         Called every tick of the ~100 Hz control loop, so the ramp is advanced a
         little per call (at THROTTLE_SERVO_SLEW_PER_S) instead of being run to
         completion here. The previous version looped to the target internally with
@@ -2667,6 +2751,11 @@ class GliderWorker(QtCore.QObject):
         target = int(clamp(throttle, 0.0, 1.0) * MAX_MOTOR_CMD)
         cutting = target == 0
         now = time.monotonic()
+        if self.propulsion_fast:
+            self._send_propulsion_packet(target)
+            self._last_throttle_write = now
+            self.last_servo_value = target
+            return
         if self._last_throttle_write is None:
             elapsed = OVERRIDE_WRITE_INTERVAL   # first command since connect
         else:
@@ -3219,6 +3308,10 @@ class GliderWorker(QtCore.QObject):
 
     # ----- teardown -------------------------------------------------------- #
     def _shutdown(self) -> None:
+        # Zero the streamed route before the param writes: those are acked and can
+        # block, and the motor should stop before anything that might wait.
+        self._send_propulsion_packet(0)
+        self.last_servo_value = 0
         try:
             if self.cf is not None:
                 self.cf.param.set_value("motorPowerSet.enable", "0")
@@ -3565,12 +3658,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Throttle
         thr_box = QtWidgets.QGroupBox("Throttle")
-        thr_layout = QtWidgets.QHBoxLayout(thr_box)
+        thr_outer = QtWidgets.QVBoxLayout(thr_box)
+        thr_layout = QtWidgets.QHBoxLayout()
         self.throttle_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.throttle_slider.setRange(0, 100)
         self.throttle_label = QtWidgets.QLabel("0%")
         self.throttle_slider.valueChanged.connect(self._on_throttle_changed)
         thr_layout.addWidget(self.throttle_slider); thr_layout.addWidget(self.throttle_label)
+        thr_outer.addLayout(thr_layout)
+
+        self.prop_fast_chk = QtWidgets.QCheckBox(
+            "Drive the ESC on the streamed fast path (needs modded firmware)")
+        self.prop_fast_chk.setChecked(PROPULSION_FAST_DEFAULT)
+        self.prop_fast_chk.setToolTip(
+            "ON  (default): throttle is streamed as a propulsion meta-command and\n"
+            "applied inside the firmware's stabilizer loop, so it reaches the ESC\n"
+            "on the next control cycle.\n"
+            "OFF: throttle is written to the servo.servoAngle param. Each write is\n"
+            "acked one at a time, so the host has to coalesce and slew-limit the\n"
+            "command and the motor runs behind the stick. Needed on stock firmware,\n"
+            "which has no propulsion decoder.\n\n"
+            "To measure the difference, log servo.angle (what the deck applied)\n"
+            "against servo_cmd (what this host asked for) and compare the lag.")
+        self.prop_fast_chk.toggled.connect(
+            lambda on: self.worker.post("propulsion_fast", bool(on)))
+        thr_outer.addWidget(self.prop_fast_chk)
         layout.addWidget(thr_box)
 
         # Autonomous setpoints
@@ -5717,6 +5829,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mv_push()
             self.worker.post("inject_advance", self.mv_advance_chk.isChecked())
             self.worker.post("inject_stick_abort", self.mv_stick_abort_chk.isChecked())
+            # The worker starts at PROPULSION_FAST_DEFAULT; push the checkbox so a
+            # route chosen before connecting is the one actually flown.
+            self.worker.post("propulsion_fast", self.prop_fast_chk.isChecked())
         else:
             # A new session must start disarmed, no matter how the last one ended.
             self.mv_arm_chk.blockSignals(True)
