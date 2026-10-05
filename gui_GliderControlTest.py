@@ -26,6 +26,7 @@ Dependencies: PySide6 (or PyQt5), matplotlib, pygame, cflib.
 import csv
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -103,6 +104,18 @@ CONTROLLER_DEBUG_LOG = False
 # Non-blocking slew so the loop never stalls; ~3000 units/tick ~= full travel
 # in ~0.2 s, smooth without flooding the radio link.
 OVERRIDE_SERVO_SLEW = 3000
+# Same idea for the propulsion throttle in NORMAL (non-override) flight, which
+# also reaches the ESC through the servo.servoAngle param. This used to ramp in a
+# BLOCKING inner loop (step 1000 every 5 ms sleep), which both stalled the ~100 Hz
+# control loop for ~100 ms per throttle move and queued ~21 acked param writes per
+# move -- the cause of motor commands running seconds behind the stick and
+# continuing to arrive after a disarm.
+#
+# Expressed as a RATE rather than a per-tick step so the ramp feels identical no
+# matter how the loop rate and the write-coalescing interval interact (a per-tick
+# step silently re-scales when either changes). 200 units/ms is exactly the old
+# loop's rate: 1000 units per 5 ms sleep, i.e. full 0..65535 travel in ~0.33 s.
+THROTTLE_SERVO_SLEW_PER_S = 200_000.0
 # Manual override drives the motors/servo through the parameter system, which is
 # request/response (each write is acked one at a time) rather than the streaming
 # commander channel used by setpoint flight. Pushing all four surfaces + throttle
@@ -174,6 +187,9 @@ SETUP_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # physical button). Several maps can be stored; one per controller type is marked
 # active and applied on Connect. Absent/corrupt file -> the built-in profile.
 CONTROLLER_MAPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_controller_maps.json")
+# Persistent maneuver library: the test card edited on the Maneuvers tab. Each
+# entry is one injectable excitation (axis + shape + amplitude + timing).
+MANEUVER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glider_maneuvers.json")
 # Root folder that holds all flight logs. Each session's CSV/Console files are
 # written into a per-day subfolder (YYYYMMDD) so logs stay grouped by flight day.
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -317,12 +333,33 @@ class CsvLogBundle:
 
     def write_headers(self) -> None:
         self.controller.writerow(["# schema_version", CSV_SCHEMA_VERSION, "dataset", "controller"])
-        self.controller.writerow(["cf_time_s", "gyro_roll", "gyro_pitch", "gyro_yaw", "set_roll", "set_pitch", "set_yaw"])
+        # inj_* is the maneuver-injector contribution to the commanded rate, in
+        # the same body axes and deg/s as set_*, APPENDED at the end so readers
+        # that index set_yaw at column 6 (loadClip.m, flight_plots) keep working
+        # on both old and new logs -- the same convention as motor_m3 /
+        # servo_angle / the EKF attitude columns.
+        #
+        # These three columns are the whole point of logging the injector at all:
+        # set_* already carries the TOTAL commanded rate (it comes off the deck
+        # as controller.*Rate), so without inj_* there is no way to tell the
+        # pilot's command apart from the injected perturbation. With it,
+        # pilot = set_* - inj_*, and the excitation is known exactly, per sample.
+        # Zero on every row when nothing is being injected.
+        self.controller.writerow(["cf_time_s", "gyro_roll", "gyro_pitch", "gyro_yaw",
+                                  "set_roll", "set_pitch", "set_yaw",
+                                  "inj_roll", "inj_pitch", "inj_yaw"])
 
         self.motor.writerow(["# schema_version", CSV_SCHEMA_VERSION, "dataset", "motor"])
         # motor_m3 (the rudder surface) is appended last so older readers that index
         # servo_cmd at column 4 keep working; new readers pick up the rudder at 5.
-        self.motor.writerow(["cf_time_s", "motor_m4", "motor_m1", "motor_m2", "servo_cmd", "motor_m3"])
+        # servo_angle is appended after it for the same reason. The two servo
+        # columns are NOT redundant: servo_cmd is this process's last_servo_value
+        # (what the host intended) while servo_angle is logged off the deck (what
+        # the deck actually applied). Their difference is the host->deck latency,
+        # which is invisible if you only have the first. servo_angle is nan on
+        # firmware built before the servo LOG_GROUP existed.
+        self.motor.writerow(["cf_time_s", "motor_m4", "motor_m1", "motor_m2", "servo_cmd",
+                             "motor_m3", "servo_angle"])
 
         self.connection.writerow(["# schema_version", CSV_SCHEMA_VERSION, "dataset", "connection"])
         self.connection.writerow(["cf_time_s", "rssi", "vbat"])
@@ -346,10 +383,20 @@ class CsvLogBundle:
         self.connection.writerow(marker)
         self.accelerometer.writerow(marker)
         self.event.writerow([host_time, "BREAKPOINT", label, "", ""])
+        self.event_file.flush()
 
     def write_event(self, event_name: str, v1: object = "", v2: object = "", v3: object = "") -> None:
         host_time = datetime.now().isoformat(timespec="seconds")
         self.event.writerow([host_time, event_name, v1, v2, v3])
+        # Flush every event. Events are tiny and rare -- a whole session produces
+        # well under the 8 KB stdio buffer -- so without this an Events.csv stays
+        # EMPTY ON DISK until close(), and any session that does not exit cleanly
+        # loses its entire annotation layer. Session 20260929_093733 did exactly
+        # that: 2.8 MB of Controller.csv (big enough to auto-flush) next to a
+        # 0-byte Events.csv, which left 3 clipped flights permanently unusable
+        # for tuning analysis because their gains are unrecoverable. The
+        # telemetry CSVs are self-flushing by volume; this file is not.
+        self.event_file.flush()
 
     def write_console(self, text: str) -> None:
         """Append console text, timestamping each completed line."""
@@ -781,6 +828,12 @@ CONTROLLER_COMMANDS: List[Tuple[str, str, str]] = [
     ("pid_sel_pitch", "PID tune: select pitch",        "edge"),
     ("pid_sel_yaw",   "PID tune: select yaw",          "edge"),
     ("save_tune",     "Save trim / gains to flash",    "edge"),
+    # Maneuver injection. Deliberately absent from both built-in profiles, so
+    # they arrive UNMAPPED and have to be bound on the Mapping tab before any
+    # button can fire a maneuver -- the logic ships inert.
+    ("inject_arm",    "Maneuver injector arm / disarm", "latch"),
+    ("inject_fire",   "Fire the selected maneuver",     "edge"),
+    ("inject_abort",  "Abort maneuver injection",       "edge"),
 ]
 
 # Commands whose loss or misassignment has flight-safety consequences. Leaving
@@ -1033,6 +1086,384 @@ def active_controller_map(controller_type: str) -> Optional[ControllerMap]:
 
 
 # --------------------------------------------------------------------------- #
+# Maneuver injection (flight-test excitation overlaid on the pilot's commands)
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS
+# ---------------
+# Tuning a rate loop from piloted flight is guesswork, because the pilot and the
+# controller are in the loop together: when the aircraft settles you cannot tell
+# whether the gains did it or the pilot did. A maneuver injector breaks that
+# ambiguity by adding a KNOWN, REPEATABLE perturbation to the rate setpoint while
+# the pilot keeps flying. The response to that perturbation is attributable to the
+# controller alone, so rise time, overshoot, damping and the kff/kp split can be
+# read straight off the log -- and compared across flights, because the input was
+# identical every time.
+#
+# The injection is ADDITIVE on the commanded rate (r), not on the surface. That
+# keeps it inside the control loop being measured: the loop sees a step/doublet in
+# its own reference, which is exactly the transfer function the analysis fits.
+#
+# SIGN CONVENTION: body axes, as the firmware sees them (and as controller.*Rate
+# is logged): +roll = right roll rate, +pitch = nose-up rate, +yaw = nose-right
+# rate. _send_rate_setpoint converts the file's stick convention into this one
+# before adding the injection, so a maneuver's amplitude means the same thing
+# whichever flight mode is driving.
+MANEUVER_AXES = ("roll", "pitch", "yaw")
+
+# (key, label, which extra fields matter) -- the shapes worth having on a glider.
+# doublet is the workhorse (zero net attitude change, excites one frequency band);
+# 3-2-1-1 is the standard multistep that covers a wide band in one short pass;
+# the chirp is for a proper frequency sweep when you want a Bode-style picture.
+MANEUVER_SHAPES: List[Tuple[str, str]] = [
+    ("step",    "Step (hold A for the duration)"),
+    ("doublet", "Doublet (+A then -A, half the duration each)"),
+    ("3211",    "3-2-1-1 multistep (+3 -2 +1 -1 pulses)"),
+    ("sine",    "Sine dwell (N cycles at one frequency)"),
+    ("chirp",   "Chirp (linear frequency sweep f0 -> f1)"),
+]
+MANEUVER_SHAPE_KEYS = tuple(k for k, _ in MANEUVER_SHAPES)
+
+# ----- safety gates (all enforced on the worker thread, every tick) --------- #
+# 1. Amplitude ceiling. The injection may never ask for more than this fraction
+#    of the axis's configured rate limit, no matter what the library says. A
+#    hand-edited JSON or a fat-fingered spin box therefore cannot command a
+#    full-scale rate step; the worst case is a little over half of a limit the
+#    user already chose to fly with.
+MANEUVER_MAX_AMPLITUDE_FRACTION = 0.6
+# 2. Duration ceiling, and a hard watchdog on top of it. Nothing can leave the
+#    injector commanding a rate for longer than this even if a shape function
+#    misbehaves -- the tick ends any run past its own total duration.
+MANEUVER_MAX_DURATION_S = 10.0
+# 3. Re-trigger cooldown. Back-to-back doublets contaminate each other's
+#    response, and a bouncing button must not fire twice.
+MANEUVER_COOLDOWN_S = 1.0
+# 4. Pilot override. Stick deflection past this fraction of full travel on the
+#    axis being excited aborts the run instantly: moving the stick is the
+#    pilot's reflex when something looks wrong, so it must be the abort action
+#    rather than something that fights the injection.
+MANEUVER_ABORT_STICK = 0.5
+# Settle ceiling: the quiet lead-in / lead-out that brackets each run so the log
+# contains the trimmed baseline the response is measured against.
+MANEUVER_MAX_SETTLE_S = 5.0
+
+
+@dataclass
+class Maneuver:
+    """One injectable excitation: an amplitude-scaled unit shape on one axis.
+
+    ``settle_s`` is dead time at zero injection before AND after the shape. It
+    is part of the run (the log is annotated across the whole thing) because a
+    response is only readable against a known-quiet baseline -- without it the
+    fit has nothing to measure the pre-input trim state from.
+    """
+    name: str = "new maneuver"
+    axis: str = "pitch"
+    shape: str = "doublet"
+    amplitude_dps: float = 20.0      # peak commanded rate, deg/s, body axes
+    duration_s: float = 1.0          # length of the shape itself
+    settle_s: float = 0.5            # quiet lead-in and lead-out
+    cycles: float = 3.0              # sine dwell only
+    f_start_hz: float = 0.5          # chirp only
+    f_end_hz: float = 4.0            # chirp only
+    enabled: bool = True             # part of the advance-through-list sequence
+
+    def sanitized(self) -> "Maneuver":
+        """A copy with every field forced into a legal range. Applied on load
+        and again when the GUI pushes the library, so neither a hand-edited file
+        nor a future widget change can hand the control loop a nonsense run."""
+        return Maneuver(
+            name=(str(self.name).strip() or "unnamed")[:40],
+            axis=self.axis if self.axis in MANEUVER_AXES else "pitch",
+            shape=self.shape if self.shape in MANEUVER_SHAPE_KEYS else "doublet",
+            # The amplitude is clamped again at run time against the live rate
+            # limit (see GliderWorker._injection_tick); this is only the
+            # sanity bound on the stored value.
+            amplitude_dps=clamp(float(self.amplitude_dps), -180.0, 180.0),
+            duration_s=clamp(float(self.duration_s), 0.1, MANEUVER_MAX_DURATION_S),
+            settle_s=clamp(float(self.settle_s), 0.0, MANEUVER_MAX_SETTLE_S),
+            cycles=clamp(float(self.cycles), 0.5, 20.0),
+            f_start_hz=clamp(float(self.f_start_hz), 0.1, 20.0),
+            f_end_hz=clamp(float(self.f_end_hz), 0.1, 20.0),
+            enabled=bool(self.enabled),
+        )
+
+    @property
+    def total_duration_s(self) -> float:
+        return 2.0 * self.settle_s + self.duration_s
+
+    def unit_value(self, t: float) -> float:
+        """The shape at time ``t`` seconds into the run, normalised to +/-1.
+
+        Every shape is defined to return exactly 0.0 outside the active window,
+        so a run always begins and ends at zero injection -- there is no step
+        discontinuity handed to the aircraft when a maneuver completes.
+        """
+        t -= self.settle_s
+        d = self.duration_s
+        if t < 0.0 or t >= d:
+            return 0.0
+        shape = self.shape
+        if shape == "step":
+            return 1.0
+        if shape == "doublet":
+            return 1.0 if t < 0.5 * d else -1.0
+        if shape == "3211":
+            # Pulse widths 3,2,1,1 in units of d/7, signs + - + -. The classic
+            # multistep: one pass excites roughly a decade of frequency, which a
+            # single doublet cannot.
+            u = d / 7.0
+            if t < 3.0 * u:
+                return 1.0
+            if t < 5.0 * u:
+                return -1.0
+            if t < 6.0 * u:
+                return 1.0
+            return -1.0
+        if shape == "sine":
+            f = self.cycles / d          # exactly N cycles in the window
+            return math.sin(2.0 * math.pi * f * t)
+        if shape == "chirp":
+            # Linear sweep: instantaneous f = f0 + k t, so the phase (its
+            # integral) carries the 1/2 k t^2 term. Integrating the frequency
+            # rather than evaluating sin(2 pi f(t) t) is what keeps the sweep
+            # phase-continuous -- the naive form jumps and injects harmonics.
+            k = (self.f_end_hz - self.f_start_hz) / d
+            phase = 2.0 * math.pi * (self.f_start_hz * t + 0.5 * k * t * t)
+            return math.sin(phase)
+        return 0.0
+
+    def describe(self) -> str:
+        bits = [f"{self.axis} {self.shape}", f"A={self.amplitude_dps:g} deg/s",
+                f"dur={self.duration_s:g}s"]
+        if self.shape == "sine":
+            bits.append(f"{self.cycles:g} cyc ({self.cycles / self.duration_s:.2f} Hz)")
+        elif self.shape == "chirp":
+            bits.append(f"{self.f_start_hz:g}->{self.f_end_hz:g} Hz")
+        if self.settle_s > 0:
+            bits.append(f"settle={self.settle_s:g}s")
+        return ", ".join(bits)
+
+
+def default_maneuvers() -> List[Maneuver]:
+    """A starter test card. Deliberately conservative amplitudes: the point of
+    the first flight with this feature is to confirm the injection is visible in
+    the log and survivable, not to get a good fit."""
+    return [
+        Maneuver(name="pitch doublet", axis="pitch", shape="doublet",
+                 amplitude_dps=20.0, duration_s=1.0, settle_s=0.5),
+        Maneuver(name="roll doublet", axis="roll", shape="doublet",
+                 amplitude_dps=25.0, duration_s=0.8, settle_s=0.5),
+        Maneuver(name="yaw doublet", axis="yaw", shape="doublet",
+                 amplitude_dps=20.0, duration_s=1.0, settle_s=0.5),
+        Maneuver(name="pitch 3-2-1-1", axis="pitch", shape="3211",
+                 amplitude_dps=20.0, duration_s=2.8, settle_s=0.5),
+        Maneuver(name="pitch step", axis="pitch", shape="step",
+                 amplitude_dps=15.0, duration_s=1.5, settle_s=0.5),
+    ]
+
+
+def load_maneuvers() -> List[Maneuver]:
+    """Read the saved test card, degrading field by field like
+    load_default_gains: a malformed library must not stop the GUI launching at
+    the flight line, and a single bad entry must not take the rest with it."""
+    try:
+        with open(MANEUVER_FILE, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return default_maneuvers()
+    except (OSError, ValueError):
+        return default_maneuvers()
+    entries = saved.get("maneuvers") if isinstance(saved, dict) else saved
+    if not isinstance(entries, list):
+        return default_maneuvers()
+    out: List[Maneuver] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        m = Maneuver()
+        for key in vars(m):
+            if key in entry:
+                try:
+                    setattr(m, key, entry[key])
+                except (TypeError, ValueError):
+                    pass
+        try:
+            out.append(m.sanitized())
+        except (TypeError, ValueError):
+            continue
+    return out or default_maneuvers()
+
+
+def save_maneuvers(maneuvers: List[Maneuver]) -> None:
+    """Persist the test card (raises OSError on failure, like save_default_gains)."""
+    payload = {"version": 1, "maneuvers": [asdict(m) for m in maneuvers]}
+    with open(MANEUVER_FILE, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+class ManeuverInjector:
+    """Run-state machine for maneuver injection. Pure logic, no Qt, no cflib.
+
+    Lives on and is only touched by the worker thread. It knows nothing about
+    the aircraft: the worker decides whether injection is permitted this tick
+    (``_injection_block_reason``) and clamps the output against the live rate
+    limits. Keeping the gates outside means this class cannot be the reason a
+    gate is missed, and it can be reasoned about (and tested) on its own.
+
+    The two-step arm/trigger split is deliberate. ``armed`` is a conscious "I
+    intend to inject on this flight" state the pilot sets once; ``trigger`` is
+    the per-run action that a controller button will later be bound to. A stray
+    button press on an unarmed injector does nothing at all.
+    """
+
+    def __init__(self) -> None:
+        self.library: List[Maneuver] = []
+        self.selected = 0
+        self.armed = False
+        self.advance = False          # step to the next enabled entry per run
+        self._run: Optional[Maneuver] = None
+        self._t0 = 0.0
+        self._last_end = 0.0
+        self._saturated = False
+        self._peak_cmd = 0.0
+        # (event_name, v1, v2) tuples for the worker to log + echo. Queued here
+        # rather than written directly so this class stays free of the logger.
+        self._events: List[Tuple[str, str, str]] = []
+
+    # ----- library ---------------------------------------------------------- #
+    def set_library(self, maneuvers: List[Maneuver], selected: Optional[int] = None) -> None:
+        self.library = [m.sanitized() for m in maneuvers]
+        if selected is not None:
+            self.selected = selected
+        self.selected = max(0, min(self.selected, max(0, len(self.library) - 1)))
+
+    def selected_maneuver(self) -> Optional[Maneuver]:
+        if 0 <= self.selected < len(self.library):
+            return self.library[self.selected]
+        return None
+
+    # ----- state ------------------------------------------------------------ #
+    @property
+    def active(self) -> bool:
+        return self._run is not None
+
+    @property
+    def axis(self) -> Optional[str]:
+        return self._run.axis if self._run is not None else None
+
+    def drain_events(self) -> List[Tuple[str, str, str]]:
+        out, self._events = self._events, []
+        return out
+
+    # ----- lifecycle -------------------------------------------------------- #
+    def set_armed(self, on: bool, now: float) -> None:
+        on = bool(on)
+        if on == self.armed:
+            return
+        self.armed = on
+        if not on:
+            self.abort("INJECTOR_DISARMED", now)
+        self._events.append(("MANEUVER_ARMED" if on else "MANEUVER_DISARMED", "", ""))
+
+    def trigger(self, now: float) -> Tuple[bool, str]:
+        """Start the selected maneuver. Returns (started, human message). Every
+        refusal is reported rather than silently ignored -- a trigger that does
+        nothing without saying why is how you end up flying a pass you think was
+        recorded and was not."""
+        if not self.armed:
+            return False, "injector is not armed"
+        if self._run is not None:
+            return False, f"'{self._run.name}' is still running"
+        if now - self._last_end < MANEUVER_COOLDOWN_S:
+            wait = MANEUVER_COOLDOWN_S - (now - self._last_end)
+            return False, f"cooldown, {wait:.1f}s left"
+        man = self.selected_maneuver()
+        if man is None:
+            return False, "the library is empty"
+        self._run = man
+        self._t0 = now
+        self._saturated = False
+        self._peak_cmd = 0.0
+        self._events.append((
+            "MANEUVER_START", man.name,
+            f"axis={man.axis} shape={man.shape} amp={man.amplitude_dps:g} "
+            f"dur={man.duration_s:g} settle={man.settle_s:g}"))
+        return True, f"injecting '{man.name}' ({man.describe()})"
+
+    def abort(self, reason: str, now: float) -> bool:
+        """End any run early. Returns True if a run was actually stopped."""
+        if self._run is None:
+            return False
+        self._finish(reason, now)
+        return True
+
+    def _finish(self, reason: str, now: float) -> None:
+        man = self._run
+        self._run = None
+        self._last_end = now
+        if man is not None:
+            self._events.append((
+                "MANEUVER_END", man.name,
+                f"reason={reason} peak={self._peak_cmd:.1f} "
+                f"saturated={'1' if self._saturated else '0'}"))
+
+    def note_saturation(self) -> None:
+        """Flag that the commanded total hit a rate limit during this run. The
+        analysis cares: a clamped sample measures the limit, not the response,
+        so a saturated pass should not be fitted."""
+        self._saturated = True
+
+    # ----- per-tick --------------------------------------------------------- #
+    def tick(self, now: float) -> Tuple[float, float, float]:
+        """The injection to add this tick, as (roll, pitch, yaw) deg/s in body
+        axes. All zeros when no run is active."""
+        man = self._run
+        if man is None:
+            return (0.0, 0.0, 0.0)
+        elapsed = now - self._t0
+        # Watchdog: end on duration, and also if the clock ever runs past it (a
+        # stalled loop, a suspended process, a shape that misreports its length).
+        if elapsed >= man.total_duration_s:
+            self._finish("COMPLETED", now)
+            if self.advance:
+                self._advance()
+            return (0.0, 0.0, 0.0)
+        value = man.amplitude_dps * man.unit_value(elapsed)
+        self._peak_cmd = max(self._peak_cmd, abs(value))
+        return (
+            value if man.axis == "roll" else 0.0,
+            value if man.axis == "pitch" else 0.0,
+            value if man.axis == "yaw" else 0.0,
+        )
+
+    def _advance(self) -> None:
+        """Move the selection to the next enabled entry, wrapping. This is what
+        turns one button into a test card: each press flies the next point."""
+        n = len(self.library)
+        if n == 0:
+            return
+        for step in range(1, n + 1):
+            idx = (self.selected + step) % n
+            if self.library[idx].enabled:
+                self.selected = idx
+                return
+
+    def status(self) -> dict:
+        """Snapshot for the GUI status line (plain data, safe to send over a
+        signal to the other thread)."""
+        man = self._run
+        sel = self.selected_maneuver()
+        return {
+            "armed": self.armed,
+            "active": man is not None,
+            "running": man.name if man is not None else "",
+            "selected": sel.name if sel is not None else "",
+            "selected_index": self.selected,
+            "saturated": self._saturated,
+        }
+
+
+# --------------------------------------------------------------------------- #
 # Worker: connection + control loop (runs on its own thread)
 # --------------------------------------------------------------------------- #
 class GliderWorker(QtCore.QObject):
@@ -1047,6 +1478,7 @@ class GliderWorker(QtCore.QObject):
     pid_value = Signal(str, str, float)  # (axis, term, value) live in-flight PID tune
     buttons_state = Signal(object)  # (armed, n_buttons, frozenset of pressed indices)
     axes_state = Signal(object)     # (armed, tuple of raw axis values) for axis detect
+    injector_state = Signal(object)  # ManeuverInjector.status() dict for the Maneuvers tab
 
     def __init__(self, buffers: PlotBuffers):
         super().__init__()
@@ -1085,10 +1517,15 @@ class GliderWorker(QtCore.QObject):
         self._override_servo_cmd = 0
         self._last_override_emit: Optional[Tuple[int, int, int, int, int]] = None
         self._last_override_write = 0.0
+        self._last_throttle_write: Optional[float] = None
         # Commander-fast override: when True, stream the raw motor/servo command on
         # the setpoint channel (responsive, needs modded firmware) instead of the
         # slower param-based motorPowerSet.* path. Toggled from the override tab.
         self._fast_override = True
+        # Set for real in _create_log_configs once the deck's TOC is known; defined
+        # here so _on_motor_log cannot raise AttributeError if a callback ever fires
+        # before that runs.
+        self.log_has_servo_angle = False
         self._last_arm_request = 0.0
         # ----- in-flight trim / PID-tune mode state ----------------------- #
         # Latch switches are level-driven; remember the last observed level so we
@@ -1104,6 +1541,22 @@ class GliderWorker(QtCore.QObject):
         # through the stored value. Keyed "trim:<axis>" / "pid:<axis>:<term>".
         self._knob_caught: Dict[str, bool] = {}
         self._knob_catch_sign: Dict[str, float] = {}
+        # ----- maneuver injection ----------------------------------------- #
+        self.injector = ManeuverInjector()
+        self.injector.set_library(load_maneuvers())
+        # Last injection actually commanded, body axes deg/s. Written here on the
+        # worker thread and read by the cflib controller-log callback on ITS
+        # thread; a whole-tuple rebind is atomic in CPython, so the reader always
+        # sees a consistent triple and no lock is needed (the same reasoning as
+        # last_servo_value). This is what lands in the inj_* CSV columns, and it
+        # is the only record of what the pilot did NOT command.
+        self._inj_cmd: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        # Abort a run when the stick on the excited axis moves past
+        # MANEUVER_ABORT_STICK. User-defeatable from the tab, because once the
+        # feature is trusted you may well want to inject while holding a turn.
+        self._inj_stick_abort = True
+        self._last_injector_emit = 0.0
+        self._last_injector_status: Optional[tuple] = None
 
     # ----- public API (called from GUI thread) ----------------------------- #
     def start(self, config: SessionConfig) -> None:
@@ -1479,6 +1932,7 @@ class GliderWorker(QtCore.QObject):
                 self._log(f"Servo trim {param} = {trim}\n")
             except Exception as exc:
                 self._log(f"Could not read {param}: {exc}\n")
+        self._write_trim_state()
 
         # Read back the persisted servo mixer map (which surface each M# drives
         # plus its invert flag) so the Control tab reflects the stored config.
@@ -1493,6 +1947,40 @@ class GliderWorker(QtCore.QObject):
                 self._log(f"Surface map {ch.upper()}: surface={surf} invert={inv}\n")
             except Exception as exc:
                 self._log(f"Could not read surface map for {ch.upper()}: {exc}\n")
+        self._write_surface_map_state()
+
+    # ----- latched-state events -------------------------------------------- #
+    # TRIM_APPLIED / SURFACE_MAP_APPLIED mirror PID_APPLIED: they record the
+    # complete mixer configuration at an instant, so clip_flights can latch the
+    # last one at or before a clip's start and re-emit it as TRIM_STATE /
+    # SURFACE_MAP_STATE. Offline analysis needs them because turning a
+    # motor_m* count into deflection-about-trim requires
+    # pwm = trim + axisSign*u: without trim it cannot locate the saturation
+    # (trimPitch=30000 clips positive pitch at 0.916 of travel but negative at
+    # 1.0), and without the surface map it cannot even say which channel is
+    # which axis. The firmware's documented defaults are NOT this aircraft's
+    # config, so only a readback is authoritative.
+    #
+    # Both emit ALL axes/channels every time, including after a single-axis
+    # change. That is the whole point: TRIM_SET already records the per-axis
+    # delta, but a latched *delta* would let a clip inherit two fresh axes and
+    # one stale one, and a log that confidently states the wrong trim is worse
+    # than one that states none -- it silently mislocates every saturation
+    # margin downstream. Reading from _last_sent keeps them in step with what
+    # was actually pushed to the deck.
+    def _write_trim_state(self) -> None:
+        self.logs.write_event(
+            "TRIM_APPLIED",
+            *(f"{axis}={self._last_sent.get(TRIM_PARAMS[axis], 'NA')}"
+              for axis in ("roll", "pitch", "yaw")))
+
+    def _write_surface_map_state(self) -> None:
+        # 4 channels into 3 value columns, so m1/m2 share the first.
+        parts = [f"{ch}:surf={self._last_sent.get(SURFACE_MAP_SURF_PARAM[ch], 'NA')}"
+                 f",inv={self._last_sent.get(SURFACE_MAP_INV_PARAM[ch], 'NA')}"
+                 for ch in SURFACE_MAP_CHANNELS]
+        self.logs.write_event("SURFACE_MAP_APPLIED",
+                              " ".join(parts[:2]), *parts[2:4])
 
     def _apply_pid_gains(self, gains: PidGains) -> None:
         self.cf.param.set_value("pid_rate.pitch_kp", gains.pitch.kp)
@@ -1507,13 +1995,34 @@ class GliderWorker(QtCore.QObject):
         self.cf.param.set_value("pid_rate.roll_ki", gains.roll.ki)
         self.cf.param.set_value("pid_rate.roll_kd", gains.roll.kd)
         self.cf.param.set_value("pid_rate.roll_kff", gains.roll.kff)
+        # Read back rather than trusting the writes, for the same reason as
+        # fwActLpf below: pid_rate.* are PARAM_PERSISTENT, so a set that fails
+        # leaves the previously STORED gains in force and the aircraft quietly
+        # flies the old tune. PID_APPLIED is the record every clipped flight is
+        # annotated with (clip_flights.CARRY_FORWARD_EVENTS), and a log that
+        # confidently states the wrong gains is worse than one that states none --
+        # it would send a tuning session chasing a change that never took.
+        readback = {}
+        for axis in PID_AXES:
+            for term in PID_TERMS:
+                param = f"pid_rate.{axis}_{term}"
+                try:
+                    readback[(axis, term)] = float(self.cf.param.get_value(param))
+                except Exception as exc:
+                    self._log(f"[pid] could not read back {param}: {exc}\n")
+                    readback[(axis, term)] = float("nan")
         # Terms are labelled so a log stays readable next to older sessions,
         # which recorded a bare (kp,ki,kd) triple and no feed-forward term.
         self.logs.write_event(
             "PID_APPLIED",
-            *(f"{axis}(kp={g.kp},ki={g.ki},kd={g.kd},kff={g.kff})"
-              for axis, g in ((a, getattr(gains, a)) for a in PID_AXES)),
+            *(f"{axis}(" + ",".join(f"{t}={readback[(axis, t)]}" for t in PID_TERMS) + ")"
+              for axis in PID_AXES),
         )
+        mismatched = [f"{axis}_{term}" for axis in PID_AXES for term in PID_TERMS
+                      if readback[(axis, term)] != getattr(getattr(gains, axis), term)]
+        if mismatched:
+            self._log("[pid] WARNING: the deck reports different gains than were "
+                      f"requested for: {', '.join(mismatched)}\n")
         self._log("PID gains applied.\n")
 
     def _create_log_configs(self) -> None:
@@ -1522,9 +2031,31 @@ class GliderWorker(QtCore.QObject):
                   "controller.pitchRate", "controller.rollRate", "controller.yawRate"):
             lg_controller.add_variable(v, "float")
 
+        # 4 x uint16 = 8 of the 26 payload bytes, so servo.angle below is free:
+        # the firmware sends one packet per block per period regardless of size.
         lg_motor = LogConfig(name="Motor", period_in_ms=self.config.period_motor_ms)
         for v in ("motor.m4", "motor.m1", "motor.m2", "motor.m3"):
             lg_motor.add_variable(v, "uint16_t")
+
+        # servo.angle is only present on firmware carrying the servo deck's
+        # LOG_GROUP. Probe the TOC instead of adding it unconditionally, because
+        # cf.log.add_config() raises on an unknown variable and that exception
+        # would propagate out of _run() and abort the whole session -- losing
+        # m1..m4 and every other block too. Degrading one column is the right
+        # failure mode; losing all telemetry because the aircraft is running an
+        # older build is not. The TOC is already fetched here: _create_log_configs
+        # is called from inside the SyncCrazyflie context.
+        self.log_has_servo_angle = False
+        try:
+            if self.cf.log.toc.get_element_by_complete_name("servo.angle") is not None:
+                lg_motor.add_variable("servo.angle", "uint16_t")
+                self.log_has_servo_angle = True
+        except Exception:
+            pass
+        if not self.log_has_servo_angle:
+            self._log("[log] servo.angle not in the deck's TOC -- logging servo_cmd "
+                      "(host intent) only. Flash firmware with the servo LOG_GROUP "
+                      "to measure host->deck command latency.\n")
 
         lg_connection = LogConfig(name="Connection", period_in_ms=self.config.period_connection_ms)
         lg_connection.add_variable("radio.rssi", "uint8_t")
@@ -1613,14 +2144,19 @@ class GliderWorker(QtCore.QObject):
             gr * flight_plots.RAD2DEG, gp * flight_plots.RAD2DEG, gy * flight_plots.RAD2DEG,
             psr, psp, psy,
         )
-        self.logs.controller.writerow([ts, gr, gp, gy, sr, sp, sy])
+        # Host-side injection snapshot (see GliderWorker._inj_cmd): read without
+        # a lock because the worker rebinds the whole tuple at once.
+        inj_r, inj_p, inj_y = self._inj_cmd
+        self.logs.controller.writerow([ts, gr, gp, gy, sr, sp, sy,
+                                       round(inj_r, 3), round(inj_p, 3), round(inj_y, 3)])
 
     def _on_motor_log(self, timestamp, data, _logconf):
         ts = timestamp / 1000.0
         m4 = float(data["motor.m4"]); m1 = float(data["motor.m1"])
         m2 = float(data["motor.m2"]); m3 = float(data["motor.m3"])
+        sa = float(data["servo.angle"]) if self.log_has_servo_angle else float("nan")
         self.buffers.add_motor(ts, m1, m2, m3, m4, float(self.last_servo_value))
-        self.logs.motor.writerow([ts, m4, m1, m2, self.last_servo_value, m3])
+        self.logs.motor.writerow([ts, m4, m1, m2, self.last_servo_value, m3, sa])
 
     def _on_connection_log(self, timestamp, data, _logconf):
         ts = timestamp / 1000.0
@@ -1652,6 +2188,12 @@ class GliderWorker(QtCore.QObject):
             return
         self.failsafe_active = True
         self.update_live(motor_armed=False, autonomous=False, throttle=0.0, manual_override=False)
+        # Stop injecting and DISARM the injector, not just abort the run. A
+        # failsafe means the link or the aircraft is in an unknown state; the
+        # pilot should have to consciously re-arm before the next perturbation.
+        self.injector.abort("FAILSAFE", time.monotonic())
+        self.injector.set_armed(False, time.monotonic())
+        self._inj_cmd = (0.0, 0.0, 0.0)
         if self.logs is not None:
             self.logs.write_breakpoint("FAILSAFE_DISARM")
             self.logs.write_event("FAILSAFE_DISARM", reason)
@@ -1714,19 +2256,21 @@ class GliderWorker(QtCore.QObject):
             if live.manual_override:
                 self._drive_manual_override(live)
                 self._feed_supervisor_keepalive()
+                # Setpoints are bypassed in override, so nothing ticks the
+                # injector down this branch -- stop any run (see _injection_tick).
+                self._injection_tick()
             elif self.config.use_controller:
                 self._handle_controller_flight(live)
             else:
                 # GUI-driven setpoints (no controller): autonomous or hold-zero.
+                # Hold-zero still routes through _send_rate_setpoint so a
+                # maneuver can be injected on the bench with no stick attached,
+                # which is how you verify the feature before flying it.
                 if live.autonomous:
-                    self.commander.send_setpoint(
-                        clamp(live.setpoint_roll, -self.config.roll_rate_limit, self.config.roll_rate_limit),
-                        -clamp(live.setpoint_pitch, -self.config.pitch_rate_limit, self.config.pitch_rate_limit),
-                        -clamp(live.setpoint_yaw, -self.config.yaw_rate_limit, self.config.yaw_rate_limit),
-                        10001,
-                    )
+                    self._send_rate_setpoint(live.setpoint_roll, live.setpoint_pitch,
+                                             live.setpoint_yaw)
                 else:
-                    self.commander.send_setpoint(0.0, 0.0, 0.0, 10001)
+                    self._send_rate_setpoint(0.0, 0.0, 0.0)
                 if live.motor_armed:
                     self._set_bl_motor_throttle(live.throttle)
 
@@ -1842,6 +2386,7 @@ class GliderWorker(QtCore.QObject):
             trim = int(clamp(int(value), 0, MAX_MOTOR_CMD))
             self._set_param_if_changed(param, trim)
             self.logs.write_event("TRIM_SET", axis, trim)
+            self._write_trim_state()
         elif action == "persist_trim":
             self._persist_trim()
         elif action == "set_surface_map":
@@ -1851,6 +2396,7 @@ class GliderWorker(QtCore.QObject):
             self._set_param_if_changed(SURFACE_MAP_SURF_PARAM[channel], surf)
             self._set_param_if_changed(SURFACE_MAP_INV_PARAM[channel], invert)
             self.logs.write_event("SURFACE_MAP_SET", channel, f"surface={surf}", f"invert={invert}")
+            self._write_surface_map_state()
         elif action == "persist_surface_map":
             self._persist_surface_map()
         elif action == "manual_override":
@@ -1897,6 +2443,51 @@ class GliderWorker(QtCore.QObject):
                 self._log(f"Button map '{payload.name}' applied.\n")
             self.logs.write_event("CONTROLLER_MAP_APPLIED",
                                   payload.name if payload is not None else "built-in")
+        elif action == "maneuver_library":
+            # The GUI owns the editable library; the worker gets a sanitized
+            # copy by value. Nothing on the control loop ever reads a widget,
+            # which is the rule that keeps the two threads independent.
+            maneuvers, selected = payload
+            self.injector.set_library(maneuvers, selected)
+            self._emit_injector_state()
+        elif action == "maneuver_select":
+            self.injector.set_library(self.injector.library, int(payload))
+            self._emit_injector_state()
+        elif action == "inject_advance":
+            self.injector.advance = bool(payload)
+        elif action == "inject_stick_abort":
+            self._inj_stick_abort = bool(payload)
+        elif action == "inject_arm":
+            self.injector.set_armed(bool(payload), time.monotonic())
+            self._drain_injector_events()
+            self._log(f"Maneuver injector {'ARMED' if payload else 'disarmed'}.\n")
+            self._emit_injector_state()
+        elif action == "inject_fire":
+            now = time.monotonic()
+            man = self.injector.selected_maneuver()
+            # Re-run the full gate here as well as in the tick: refusing to
+            # START is much better than starting and aborting one tick later,
+            # and it gives the pilot a reason instead of a silent no-op.
+            blocked = self._injection_block_reason(
+                self._live_snapshot(), man.axis if man is not None else None)
+            if blocked is not None:
+                self.logs.write_event("MANEUVER_REJECTED", blocked,
+                                      man.name if man is not None else "")
+                self._log(f"Maneuver REJECTED: {blocked}.\n")
+            else:
+                ok, message = self.injector.trigger(now)
+                if not ok:
+                    self.logs.write_event("MANEUVER_REJECTED", message,
+                                          man.name if man is not None else "")
+                self._log(f"{'Maneuver: ' if ok else 'Maneuver REJECTED: '}{message}\n")
+                self._drain_injector_events()
+            self._emit_injector_state()
+        elif action == "inject_abort":
+            if self.injector.abort("PILOT_ABORT", time.monotonic()):
+                self._log("Maneuver aborted.\n")
+            self._inj_cmd = (0.0, 0.0, 0.0)
+            self._drain_injector_events()
+            self._emit_injector_state()
         elif action == "event":
             self.logs.write_event(*payload)
 
@@ -2051,17 +2642,51 @@ class GliderWorker(QtCore.QObject):
         self.logs.write_event("SURFACE_MAP_PERSIST_REQUEST")
 
     def _set_bl_motor_throttle(self, throttle: float) -> None:
-        throttle = clamp(throttle, 0.0, 1.0)
-        target = int(throttle * MAX_MOTOR_CMD)
-        step = 1000
-        if target == self.last_servo_value:
-            return
-        direction = 1 if target > self.last_servo_value else -1
-        for value in range(self.last_servo_value, target, step * direction):
-            self.cf.param.set_value("servo.servoAngle", value)
-            time.sleep(0.005)
-        self.cf.param.set_value("servo.servoAngle", target)
-        self.last_servo_value = target
+        """Drive the propulsion ESC toward ``throttle`` (0..1), non-blocking.
+
+        Called every tick of the ~100 Hz control loop, so the ramp is advanced a
+        little per call (at THROTTLE_SERVO_SLEW_PER_S) instead of being run to
+        completion here. The previous version looped to the target internally with
+        a 5 ms sleep per step, which was the root cause of two separate faults:
+
+          * it blocked the control loop for ~100 ms per throttle move, during
+            which no setpoints were streamed and no controller input was read;
+          * it emitted ~21 param writes per move. Param writes are NOT
+            fire-and-forget: cflib serialises them one at a time and waits for the
+            deck to echo each one back (param.py's _ParamUpdater: an unbounded
+            FIFO, wait_lock, send_packet(expected_reply=...)). Feeding that queue
+            faster than the radio round-trip makes it grow without bound, so
+            commands arrive seconds late and keep arriving after the stick stops
+            -- including after a disarm, because the backlog still has to drain.
+
+        Writes are coalesced to OVERRIDE_WRITE_INTERVAL for the same reason the
+        manual-override path coalesces its own: the link should always carry the
+        freshest command rather than a queue of stale ones. A cut to zero bypasses
+        the timer, so disarming still stops the motor on the very next tick.
+        """
+        target = int(clamp(throttle, 0.0, 1.0) * MAX_MOTOR_CMD)
+        cutting = target == 0
+        now = time.monotonic()
+        if self._last_throttle_write is None:
+            elapsed = OVERRIDE_WRITE_INTERVAL   # first command since connect
+        else:
+            elapsed = now - self._last_throttle_write
+            if not cutting and elapsed < OVERRIDE_WRITE_INTERVAL:
+                return                  # too soon: leave last_servo_value alone so
+                                        # the next due tick resumes from what the
+                                        # deck was actually last told
+        # Slew by the time actually elapsed, so the ramp rate is set by
+        # THROTTLE_SERVO_SLEW_PER_S alone and not by how often this happens to run.
+        # elapsed is capped at a little over one write interval so a stalled loop
+        # (or a long gap since the last command) can only ever ramp the ESC by
+        # about one write's worth per write -- never a single large throttle jump.
+        # Capping makes a stall ramp SLOWER, which is the safe direction.
+        step = int(THROTTLE_SERVO_SLEW_PER_S * min(elapsed, OVERRIDE_WRITE_INTERVAL * 1.5))
+        value = target if cutting else self._slew(
+            self.last_servo_value, target, max(step, 1))
+        self._set_param_if_changed("servo.servoAngle", value)
+        self._last_throttle_write = now
+        self.last_servo_value = value
 
     # ----- controller input (manual / autonomous flight) ------------------- #
     def _axis(self, idx: int, sign: float = 1.0) -> float:
@@ -2223,6 +2848,18 @@ class GliderWorker(QtCore.QObject):
                 self.update_live(override_with_controller=True)
             self.override_mode.emit(bool(ovr_level), True if ovr_level else False)
 
+        # --- maneuver injection (unmapped until bound on the Mapping tab) -- #
+        # Routed through _handle_command rather than touching the injector
+        # directly, so a controller button and the tab's buttons take exactly
+        # the same path -- including the gate checks and the logging.
+        inj_changed, inj_level = self._latch_edge("inject_arm")
+        if inj_changed and inj_level is not None:
+            self._handle_command("inject_arm", inj_level)
+        if self._edge_cmd("inject_fire"):
+            self._handle_command("inject_fire", None)
+        if self._edge_cmd("inject_abort"):
+            self._handle_command("inject_abort", None)
+
         # Re-snapshot so tune-mode logic sees arm/override changes from this tick.
         self._poll_tune_modes(self._live_snapshot())
 
@@ -2329,6 +2966,7 @@ class GliderWorker(QtCore.QObject):
 
     def _apply_trim_knobs(self) -> None:
         lo, hi = TRIM_KNOB_RANGE
+        changed = False
         for axis, idx in self._trim_knob_axes().items():
             if idx < 0:
                 continue
@@ -2342,6 +2980,12 @@ class GliderWorker(QtCore.QObject):
                 self._set_param_if_changed(param, ival)
                 self.trim_value.emit(axis, ival)
                 self.logs.write_event("TRIM_SET", axis, ival)
+                changed = True
+        # One combined state row per pass, not per axis: this runs in the control
+        # loop, so a knob swept across two axes would otherwise emit a burst of
+        # near-identical rows.
+        if changed:
+            self._write_trim_state()
 
     def _apply_pid_knobs(self) -> None:
         axis = self._pid_axis
@@ -2412,25 +3056,166 @@ class GliderWorker(QtCore.QObject):
 
         live = self._live_snapshot()
         if live.autonomous:
-            self.commander.send_setpoint(
-                clamp(live.setpoint_roll, -self.config.roll_rate_limit, self.config.roll_rate_limit),
-                -clamp(live.setpoint_pitch, -self.config.pitch_rate_limit, self.config.pitch_rate_limit),
-                -clamp(live.setpoint_yaw, -self.config.yaw_rate_limit, self.config.yaw_rate_limit),
-                10001,
-            )
+            self._send_rate_setpoint(live.setpoint_roll, live.setpoint_pitch,
+                                     live.setpoint_yaw)
         elif not live.trimmed:
             roll_cmd = roll_axis if abs(roll_axis) > JOYSTICK_DEADBAND else 0.0
             pitch_cmd = pitch_axis if abs(pitch_axis) > JOYSTICK_DEADBAND else 0.0
             yaw_cmd = yaw_axis if abs(yaw_axis) > JOYSTICK_DEADBAND else 0.0
-            self.commander.send_setpoint(
-                roll_cmd * self.config.roll_rate_limit,
-                -pitch_cmd * self.config.pitch_rate_limit,
-                -yaw_cmd * self.config.yaw_rate_limit,
-                10001,
-            )
+            self._send_rate_setpoint(roll_cmd * self.config.roll_rate_limit,
+                                     pitch_cmd * self.config.pitch_rate_limit,
+                                     yaw_cmd * self.config.yaw_rate_limit)
+        else:
+            # Trim-lock: no setpoint goes out, so the injector must be stopped
+            # explicitly here. _send_rate_setpoint is the only thing that ticks
+            # it, and a path that never calls it would otherwise leave a run
+            # frozen mid-shape with its clock stopped.
+            self._injection_tick()
 
         if live.motor_armed:
             self._set_bl_motor_throttle(live.throttle)
+
+    # ----- rate setpoints + maneuver injection ----------------------------- #
+    def _send_rate_setpoint(self, roll: float, pitch: float, yaw: float) -> None:
+        """The single exit for every rate setpoint this app sends.
+
+        Arguments arrive in the *stick* convention the call sites have always
+        used -- i.e. exactly what used to be handed to send_setpoint before its
+        -1 on pitch/yaw. Those flips happen here instead, which puts the rest of
+        this function in BODY axes (+roll right, +pitch nose-up, +yaw nose-right),
+        the same convention the firmware logs controller.*Rate in and the only
+        one in which a maneuver amplitude means a fixed physical thing.
+
+        Centralising the send is a safety property, not tidiness. There were
+        three send_setpoint call sites (autonomous-with-controller,
+        stick-driven, and GUI hold-zero); an injection added at one of them
+        would be silently absent in the other two flight modes, and the rate
+        clamp that only one of them applied would stay missing at the others.
+        One exit means the injection and the limit cannot be bypassed by taking
+        a different path through the loop.
+        """
+        r, p, y = float(roll), -float(pitch), -float(yaw)
+        inj_r, inj_p, inj_y = self._injection_tick()
+        tgt_r, tgt_p, tgt_y = r + inj_r, p + inj_p, y + inj_y
+        lim_r = self.config.roll_rate_limit
+        lim_p = self.config.pitch_rate_limit
+        lim_y = self.config.yaw_rate_limit
+        out_r = clamp(tgt_r, -lim_r, lim_r)
+        out_p = clamp(tgt_p, -lim_p, lim_p)
+        out_y = clamp(tgt_y, -lim_y, lim_y)
+        if self.injector.active and (abs(out_r - tgt_r) > 1e-6
+                                     or abs(out_p - tgt_p) > 1e-6
+                                     or abs(out_y - tgt_y) > 1e-6):
+            # The pilot was already close to a rate limit, so part of the
+            # injection was clipped off. Flagged on the run (MANEUVER_END
+            # carries saturated=1) because a clamped pass measures the limit,
+            # not the response -- the same trap that dragged the flight9 pitch
+            # fit from 0.551 to 0.227. Better to know the pass is unusable than
+            # to fit it.
+            self.injector.note_saturation()
+        self.commander.send_setpoint(out_r, out_p, out_y, 10001)
+
+    def _stick_deflection(self, axis: str) -> float:
+        """Rest-corrected stick travel on one control axis, 0..1-ish. 0.0 when
+        there is no controller, which makes the pilot-override gate inert
+        instead of accidentally permissive."""
+        if self.joystick is None or not self.config.use_controller:
+            return 0.0
+        p = self.profile
+        idx, sign = {
+            "roll": (p.roll_axis, p.roll_sign),
+            "pitch": (p.pitch_axis, p.pitch_sign),
+            "yaw": (p.yaw_axis, p.yaw_sign),
+        }.get(axis, (-1, 1.0))
+        return abs(self._axis_c(idx, sign))
+
+    def _injection_block_reason(self, live: LiveControl,
+                                axis: Optional[str] = None) -> Optional[str]:
+        """Why injection must not be commanded right now, or None if it may be.
+
+        Each of these is a state in which the rate setpoint is either not
+        reaching the aircraft or not the pilot's to perturb, so injecting would
+        at best burn a test point and at worst add a disturbance nobody asked
+        for. Checked every tick, not just at trigger time: a maneuver that was
+        legal when it started must still stop the moment the state changes.
+        """
+        if self.failsafe_active:
+            return "FAILSAFE"
+        if live.manual_override:
+            # Override streams raw motor/servo values and bypasses the
+            # controller; the rate loop being measured is not even running.
+            return "MANUAL_OVERRIDE"
+        if live.trimmed:
+            # Trim / lock-servos sends no setpoint at all, so an injection here
+            # would advance the shape clock against an aircraft that cannot see it.
+            return "TRIM_LOCK"
+        if not self.injector.armed:
+            return "NOT_ARMED"
+        axis = axis or self.injector.axis
+        if self._inj_stick_abort and axis is not None:
+            if self._stick_deflection(axis) > MANEUVER_ABORT_STICK:
+                # Moving the stick is the pilot's reflex when a pass looks
+                # wrong, so it has to BE the abort rather than something that
+                # fights the injection for authority.
+                return "PILOT_OVERRIDE"
+        return None
+
+    def _injection_tick(self) -> Tuple[float, float, float]:
+        """Advance the injector one tick and return (roll, pitch, yaw) deg/s in
+        body axes, after the gates and the hard amplitude ceiling."""
+        now = time.monotonic()
+        live = self._live_snapshot()
+        reason = self._injection_block_reason(live)
+        if reason is not None:
+            self.injector.abort(reason, now)
+            self._inj_cmd = (0.0, 0.0, 0.0)
+        else:
+            inj = self.injector.tick(now)
+            # The ceiling is applied against the LIVE rate limits rather than
+            # the stored amplitude, so it tracks whatever the pilot chose to fly
+            # with on the Setup tab. A library edited by hand to 500 deg/s still
+            # cannot command more than 60% of the limit.
+            cap_r = MANEUVER_MAX_AMPLITUDE_FRACTION * self.config.roll_rate_limit
+            cap_p = MANEUVER_MAX_AMPLITUDE_FRACTION * self.config.pitch_rate_limit
+            cap_y = MANEUVER_MAX_AMPLITUDE_FRACTION * self.config.yaw_rate_limit
+            self._inj_cmd = (clamp(inj[0], -cap_r, cap_r),
+                             clamp(inj[1], -cap_p, cap_p),
+                             clamp(inj[2], -cap_y, cap_y))
+        self._drain_injector_events()
+        self._emit_injector_state()
+        return self._inj_cmd
+
+    def _drain_injector_events(self) -> None:
+        """Move the injector's queued events into the flight log and the console.
+
+        MANEUVER_START / MANEUVER_END name the pass and its parameters; they are
+        NOT how the analysis finds the input in time. Events.csv is stamped in
+        host time to the second, which is useless against a 1 s doublet, so the
+        timing comes from the per-sample inj_roll/inj_pitch/inj_yaw columns in
+        Controller.csv instead. The events exist to identify and to tell you
+        whether the pass saturated.
+        """
+        if self.logs is None:
+            return
+        for name, v1, v2 in self.injector.drain_events():
+            self.logs.write_event(name, v1, v2)
+            detail = " ".join(part for part in (v1, v2) if part)
+            self._log(f"[maneuver] {name}{(' ' + detail) if detail else ''}\n")
+
+    def _emit_injector_state(self) -> None:
+        """Publish injector state to the Maneuvers tab, on change plus a slow
+        heartbeat -- same pattern as _emit_button_state, for the same reason: at
+        100 Hz an unconditional emit would be 100 cross-thread signals a second
+        to repaint a label that usually has not changed."""
+        st = self.injector.status()
+        key = (st["armed"], st["active"], st["running"], st["selected_index"],
+               st["saturated"])
+        now = time.monotonic()
+        if key == self._last_injector_status and (now - self._last_injector_emit) < 0.5:
+            return
+        self._last_injector_status = key
+        self._last_injector_emit = now
+        self.injector_state.emit(st)
 
     # ----- teardown -------------------------------------------------------- #
     def _shutdown(self) -> None:
@@ -2519,12 +3304,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.pid_value.connect(self._on_pid_value)
         self.worker.buttons_state.connect(self._on_buttons_state)
         self.worker.axes_state.connect(self._on_axes_state)
+        self.worker.injector_state.connect(self._on_injector_state)
 
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._scrollable(self._build_setup_tab()), "Setup")
         self.tabs.addTab(self._build_plots_tab(), "Live Plots")
         self.tabs.addTab(self._scrollable(self._build_control_tab()), "Control")
+        self.tabs.addTab(self._scrollable(self._build_maneuver_tab()), "Maneuvers")
         self.tabs.addTab(self._scrollable(self._build_override_tab()), "Manual Override")
         self.tabs.addTab(self._scrollable(self._build_mapping_tab()), "Mapping")
         self.tabs.addTab(self._build_flightdata_tab(), "Flight Data")
@@ -2897,6 +3684,423 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sp_spin(self) -> QtWidgets.QDoubleSpinBox:
         s = QtWidgets.QDoubleSpinBox(); s.setRange(-500.0, 500.0); return s
+
+    # ----- Maneuvers tab --------------------------------------------------- #
+    def _build_maneuver_tab(self) -> QtWidgets.QWidget:
+        """Test-card editor + run controls for the maneuver injector.
+
+        The library is edited here and pushed to the worker by value on every
+        change; the worker never reads a widget. Buttons on this tab and a (yet
+        unbound) controller button post the identical commands, so there is one
+        implementation of arm / fire / abort rather than a GUI copy and a
+        controller copy that can drift apart.
+        """
+        w = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(w)
+
+        self.maneuvers: List[Maneuver] = load_maneuvers()
+        # Guard against feedback: populating the editor fires the same
+        # valueChanged signals the user's edits do, which would write the
+        # half-populated editor straight back into the library.
+        self._mv_loading = False
+
+        top = QtWidgets.QHBoxLayout()
+        outer.addLayout(top)
+
+        # --- library list ---------------------------------------------------
+        lib_box = QtWidgets.QGroupBox("Test card")
+        lib_lay = QtWidgets.QVBoxLayout(lib_box)
+        self.mv_list = QtWidgets.QListWidget()
+        self.mv_list.setMinimumWidth(260)
+        self.mv_list.currentRowChanged.connect(self._mv_on_row_changed)
+        self.mv_list.itemChanged.connect(self._mv_on_item_changed)
+        lib_lay.addWidget(self.mv_list)
+        lib_lay.addWidget(QtWidgets.QLabel(
+            "The tick box marks an entry as part of the sequence used by\n"
+            "\"advance after each run\". Order is the order of this list."))
+        row = QtWidgets.QHBoxLayout()
+        for label, slot in (("Add", self._mv_add), ("Duplicate", self._mv_duplicate),
+                            ("Delete", self._mv_delete)):
+            btn = QtWidgets.QPushButton(label)
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        lib_lay.addLayout(row)
+        row2 = QtWidgets.QHBoxLayout()
+        save_btn = QtWidgets.QPushButton("Save library")
+        save_btn.setToolTip(f"Write the card to {os.path.basename(MANEUVER_FILE)} "
+                            f"so it reloads on the next launch.")
+        save_btn.clicked.connect(self._mv_save)
+        revert_btn = QtWidgets.QPushButton("Revert to saved")
+        revert_btn.clicked.connect(self._mv_revert)
+        row2.addWidget(save_btn); row2.addWidget(revert_btn)
+        lib_lay.addLayout(row2)
+        top.addWidget(lib_box)
+
+        # --- editor ---------------------------------------------------------
+        ed_box = QtWidgets.QGroupBox("Selected maneuver")
+        ed_lay = QtWidgets.QVBoxLayout(ed_box)
+        form = QtWidgets.QFormLayout()
+        ed_lay.addLayout(form)
+
+        self.mv_name = QtWidgets.QLineEdit()
+        self.mv_name.editingFinished.connect(self._mv_editor_changed)
+        form.addRow("Name:", self.mv_name)
+
+        self.mv_axis = QtWidgets.QComboBox()
+        for axis in MANEUVER_AXES:
+            self.mv_axis.addItem(axis.capitalize(), axis)
+        self.mv_axis.currentIndexChanged.connect(self._mv_editor_changed)
+        form.addRow("Axis:", self.mv_axis)
+
+        self.mv_shape = QtWidgets.QComboBox()
+        for key, label in MANEUVER_SHAPES:
+            self.mv_shape.addItem(label, key)
+        self.mv_shape.currentIndexChanged.connect(self._mv_shape_changed)
+        form.addRow("Shape:", self.mv_shape)
+
+        self.mv_amp = QtWidgets.QDoubleSpinBox()
+        self.mv_amp.setRange(-180.0, 180.0); self.mv_amp.setDecimals(1)
+        self.mv_amp.setSingleStep(1.0); self.mv_amp.setSuffix(" deg/s")
+        self.mv_amp.setToolTip(
+            "Peak commanded rate, added to the pilot's command.\n"
+            f"Capped in flight at {MANEUVER_MAX_AMPLITUDE_FRACTION:.0%} of that "
+            "axis's rate limit from the Setup tab, whatever is typed here.")
+        self.mv_amp.valueChanged.connect(self._mv_editor_changed)
+        form.addRow("Amplitude:", self.mv_amp)
+
+        self.mv_dur = QtWidgets.QDoubleSpinBox()
+        self.mv_dur.setRange(0.1, MANEUVER_MAX_DURATION_S); self.mv_dur.setDecimals(2)
+        self.mv_dur.setSingleStep(0.1); self.mv_dur.setSuffix(" s")
+        self.mv_dur.valueChanged.connect(self._mv_editor_changed)
+        form.addRow("Duration:", self.mv_dur)
+
+        self.mv_settle = QtWidgets.QDoubleSpinBox()
+        self.mv_settle.setRange(0.0, MANEUVER_MAX_SETTLE_S); self.mv_settle.setDecimals(2)
+        self.mv_settle.setSingleStep(0.1); self.mv_settle.setSuffix(" s")
+        self.mv_settle.setToolTip(
+            "Quiet time at zero injection before and after the shape, inside the\n"
+            "run. The response can only be measured against a known baseline, so\n"
+            "this is what gives the fit its pre-input trim state.")
+        self.mv_settle.valueChanged.connect(self._mv_editor_changed)
+        form.addRow("Settle (each end):", self.mv_settle)
+
+        self.mv_cycles = QtWidgets.QDoubleSpinBox()
+        self.mv_cycles.setRange(0.5, 20.0); self.mv_cycles.setDecimals(1)
+        self.mv_cycles.setSingleStep(0.5)
+        self.mv_cycles.valueChanged.connect(self._mv_editor_changed)
+        self.mv_cycles_row = QtWidgets.QLabel("Cycles (sine):")
+        form.addRow(self.mv_cycles_row, self.mv_cycles)
+
+        self.mv_f0 = QtWidgets.QDoubleSpinBox()
+        self.mv_f0.setRange(0.1, 20.0); self.mv_f0.setDecimals(2)
+        self.mv_f0.setSingleStep(0.1); self.mv_f0.setSuffix(" Hz")
+        self.mv_f0.valueChanged.connect(self._mv_editor_changed)
+        self.mv_f0_row = QtWidgets.QLabel("Chirp start:")
+        form.addRow(self.mv_f0_row, self.mv_f0)
+
+        self.mv_f1 = QtWidgets.QDoubleSpinBox()
+        self.mv_f1.setRange(0.1, 20.0); self.mv_f1.setDecimals(2)
+        self.mv_f1.setSingleStep(0.1); self.mv_f1.setSuffix(" Hz")
+        self.mv_f1.valueChanged.connect(self._mv_editor_changed)
+        self.mv_f1_row = QtWidgets.QLabel("Chirp end:")
+        form.addRow(self.mv_f1_row, self.mv_f1)
+
+        # Preview. Worth the widget: the shape functions are the one part of
+        # this that is easy to get subtly wrong (a 3-2-1-1 with the wrong pulse
+        # widths still looks plausible in numbers), and this draws exactly what
+        # the control loop will command, from the same unit_value() code.
+        self.mv_fig = Figure(figsize=(5, 2.0))
+        self.mv_ax = self.mv_fig.add_subplot(111)
+        self.mv_canvas = FigureCanvas(self.mv_fig)
+        self.mv_canvas.setMinimumHeight(170)
+        ed_lay.addWidget(self.mv_canvas)
+        top.addWidget(ed_box, 1)
+
+        # --- run controls ---------------------------------------------------
+        run_box = QtWidgets.QGroupBox("Run")
+        run_lay = QtWidgets.QVBoxLayout(run_box)
+        btn_row = QtWidgets.QHBoxLayout()
+        self.mv_arm_chk = QtWidgets.QCheckBox("Arm injector")
+        self.mv_arm_chk.setToolTip(
+            "Two-step on purpose: arming is the conscious \"I intend to inject on\n"
+            "this flight\" decision, firing is the per-pass action. A stray press\n"
+            "of an unarmed injector does nothing.")
+        self.mv_arm_chk.toggled.connect(self._mv_arm)
+        btn_row.addWidget(self.mv_arm_chk)
+        self.mv_fire_btn = QtWidgets.QPushButton("Fire selected")
+        self.mv_fire_btn.clicked.connect(self._mv_fire)
+        btn_row.addWidget(self.mv_fire_btn)
+        self.mv_abort_btn = QtWidgets.QPushButton("Abort")
+        self.mv_abort_btn.clicked.connect(self._mv_abort)
+        btn_row.addWidget(self.mv_abort_btn)
+        btn_row.addStretch(1)
+        run_lay.addLayout(btn_row)
+
+        self.mv_advance_chk = QtWidgets.QCheckBox(
+            "Advance to the next ticked entry after each run")
+        self.mv_advance_chk.setToolTip(
+            "Turns one button into a test card: each trigger flies the next point\n"
+            "in the list instead of repeating the same one.")
+        self.mv_advance_chk.toggled.connect(
+            lambda on: self.worker.post("inject_advance", bool(on)))
+        run_lay.addWidget(self.mv_advance_chk)
+
+        self.mv_stick_abort_chk = QtWidgets.QCheckBox(
+            f"Abort if the stick on that axis moves past "
+            f"{MANEUVER_ABORT_STICK:.0%} travel")
+        self.mv_stick_abort_chk.setChecked(True)
+        self.mv_stick_abort_chk.toggled.connect(
+            lambda on: self.worker.post("inject_stick_abort", bool(on)))
+        run_lay.addWidget(self.mv_stick_abort_chk)
+
+        self.mv_status = QtWidgets.QLabel("Injector: disarmed")
+        self.mv_status.setStyleSheet("font-weight: bold;")
+        run_lay.addWidget(self.mv_status)
+        outer.addWidget(run_box)
+
+        gates = QtWidgets.QLabel(
+            "Safety gates, all re-checked every control tick (~100 Hz):\n"
+            f"  - amplitude is capped at {MANEUVER_MAX_AMPLITUDE_FRACTION:.0%} of "
+            f"the axis rate limit, and the total command is still clamped to the limit\n"
+            f"  - duration is capped at {MANEUVER_MAX_DURATION_S:g} s, with a "
+            f"watchdog that ends any run past its own length\n"
+            f"  - {MANEUVER_COOLDOWN_S:g} s cooldown between runs, and only one run "
+            f"at a time\n"
+            "  - a run aborts instantly on failsafe/link loss, manual override "
+            "or trim-lock\n"
+            f"  - ...and on pilot input past {MANEUVER_ABORT_STICK:.0%} travel on the "
+            f"INJECTED axis only (other axes are free; held trim counts toward it)\n"
+            "  - a failsafe also DISARMS the injector, so it has to be re-armed "
+            "deliberately\n"
+            "  - the injection is logged per sample as inj_roll/inj_pitch/inj_yaw "
+            "in Controller.csv\n"
+            "Controller buttons for arm / fire / abort ship UNMAPPED — bind them on "
+            "the Mapping tab.")
+        gates.setStyleSheet("color: #555;")
+        outer.addWidget(gates)
+        outer.addStretch(1)
+
+        self._mv_refresh_list(select=0)
+        return w
+
+    # ----- Maneuvers tab: library editing ---------------------------------- #
+    def _mv_refresh_list(self, select: Optional[int] = None) -> None:
+        """Rebuild the list widget from self.maneuvers."""
+        prev = self.mv_list.currentRow() if select is None else select
+        self._mv_loading = True
+        self.mv_list.clear()
+        for man in self.maneuvers:
+            item = QtWidgets.QListWidgetItem(f"{man.name}  —  {man.describe()}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if man.enabled else Qt.Unchecked)
+            self.mv_list.addItem(item)
+        self._mv_loading = False
+        if self.maneuvers:
+            self.mv_list.setCurrentRow(max(0, min(prev, len(self.maneuvers) - 1)))
+        else:
+            self._mv_load_editor(None)
+        self._mv_push()
+
+    def _mv_current(self) -> Optional[Maneuver]:
+        row = self.mv_list.currentRow()
+        if 0 <= row < len(self.maneuvers):
+            return self.maneuvers[row]
+        return None
+
+    def _mv_on_row_changed(self, row: int) -> None:
+        self._mv_load_editor(self._mv_current())
+        if 0 <= row < len(self.maneuvers) and getattr(self, "_worker_running", False):
+            self.worker.post("maneuver_select", row)
+
+    def _mv_on_item_changed(self, item) -> None:
+        """Only the tick box can change here (the text is set programmatically),
+        so this is the enabled flag."""
+        if self._mv_loading:
+            return
+        row = self.mv_list.row(item)
+        if 0 <= row < len(self.maneuvers):
+            self.maneuvers[row].enabled = item.checkState() == Qt.Checked
+            self._mv_push()
+
+    def _mv_load_editor(self, man: Optional[Maneuver]) -> None:
+        self._mv_loading = True
+        try:
+            enabled = man is not None
+            for wdg in (self.mv_name, self.mv_axis, self.mv_shape, self.mv_amp,
+                        self.mv_dur, self.mv_settle, self.mv_cycles,
+                        self.mv_f0, self.mv_f1):
+                wdg.setEnabled(enabled)
+            if man is None:
+                self.mv_name.setText("")
+                self._mv_preview(None)
+                return
+            self.mv_name.setText(man.name)
+            self.mv_axis.setCurrentIndex(max(0, self.mv_axis.findData(man.axis)))
+            self.mv_shape.setCurrentIndex(max(0, self.mv_shape.findData(man.shape)))
+            self.mv_amp.setValue(man.amplitude_dps)
+            self.mv_dur.setValue(man.duration_s)
+            self.mv_settle.setValue(man.settle_s)
+            self.mv_cycles.setValue(man.cycles)
+            self.mv_f0.setValue(man.f_start_hz)
+            self.mv_f1.setValue(man.f_end_hz)
+        finally:
+            self._mv_loading = False
+        self._mv_shape_rows(man.shape)
+        self._mv_preview(man)
+
+    def _mv_shape_rows(self, shape: str) -> None:
+        """Show only the parameters the chosen shape actually uses. Leaving a
+        dead 'Chirp end' box live next to a doublet invites someone to tune it
+        and wonder why nothing changed."""
+        sine = shape == "sine"
+        chirp = shape == "chirp"
+        for wdg, on in ((self.mv_cycles, sine), (self.mv_cycles_row, sine),
+                        (self.mv_f0, chirp), (self.mv_f0_row, chirp),
+                        (self.mv_f1, chirp), (self.mv_f1_row, chirp)):
+            wdg.setVisible(on)
+
+    def _mv_shape_changed(self) -> None:
+        self._mv_shape_rows(str(self.mv_shape.currentData()))
+        self._mv_editor_changed()
+
+    def _mv_editor_changed(self) -> None:
+        """Write the editor back into the selected maneuver."""
+        if self._mv_loading:
+            return
+        row = self.mv_list.currentRow()
+        if not (0 <= row < len(self.maneuvers)):
+            return
+        man = Maneuver(
+            name=self.mv_name.text(),
+            axis=str(self.mv_axis.currentData()),
+            shape=str(self.mv_shape.currentData()),
+            amplitude_dps=self.mv_amp.value(),
+            duration_s=self.mv_dur.value(),
+            settle_s=self.mv_settle.value(),
+            cycles=self.mv_cycles.value(),
+            f_start_hz=self.mv_f0.value(),
+            f_end_hz=self.mv_f1.value(),
+            enabled=self.maneuvers[row].enabled,
+        ).sanitized()
+        self.maneuvers[row] = man
+        item = self.mv_list.item(row)
+        if item is not None:
+            self._mv_loading = True
+            item.setText(f"{man.name}  —  {man.describe()}")
+            self._mv_loading = False
+        self._mv_preview(man)
+        self._mv_push()
+
+    def _mv_preview(self, man: Optional[Maneuver]) -> None:
+        """Plot the commanded injection against time, from the same
+        unit_value() the control loop uses."""
+        self.mv_ax.clear()
+        if man is not None:
+            total = man.total_duration_s
+            n = max(200, int(total * 400))
+            ts = [total * i / (n - 1) for i in range(n)]
+            vs = [man.amplitude_dps * man.unit_value(t) for t in ts]
+            self.mv_ax.plot(ts, vs, lw=1.4)
+            self.mv_ax.axhline(0.0, color="0.7", lw=0.8)
+            if man.settle_s > 0:
+                for x in (man.settle_s, man.settle_s + man.duration_s):
+                    self.mv_ax.axvline(x, color="0.8", lw=0.8, ls="--")
+            self.mv_ax.set_title(f"{man.name}: injected {man.axis} rate", fontsize=9)
+            self.mv_ax.set_xlabel("time into run (s)", fontsize=8)
+            self.mv_ax.set_ylabel("deg/s", fontsize=8)
+            self.mv_ax.tick_params(labelsize=7)
+            self.mv_ax.margins(x=0.02, y=0.2)
+        self.mv_fig.tight_layout()
+        self.mv_canvas.draw_idle()
+
+    def _mv_push(self) -> None:
+        """Send the library (by value) to the worker, if a session is live."""
+        if not getattr(self, "_worker_running", False):
+            return
+        self.worker.post("maneuver_library",
+                         (list(self.maneuvers), self.mv_list.currentRow()))
+
+    def _mv_add(self) -> None:
+        self.maneuvers.append(Maneuver())
+        self._mv_refresh_list(select=len(self.maneuvers) - 1)
+
+    def _mv_duplicate(self) -> None:
+        man = self._mv_current()
+        if man is None:
+            return
+        copy = Maneuver(**asdict(man))
+        copy.name = f"{man.name} copy"
+        self.maneuvers.insert(self.mv_list.currentRow() + 1, copy.sanitized())
+        self._mv_refresh_list(select=self.mv_list.currentRow() + 1)
+
+    def _mv_delete(self) -> None:
+        row = self.mv_list.currentRow()
+        if not (0 <= row < len(self.maneuvers)):
+            return
+        del self.maneuvers[row]
+        self._mv_refresh_list(select=max(0, row - 1))
+
+    def _mv_save(self) -> None:
+        try:
+            save_maneuvers(self.maneuvers)
+        except OSError as exc:
+            self._append_console(f"[maneuver] could not save {MANEUVER_FILE}: {exc}\n")
+            return
+        self._append_console(f"[maneuver] saved {len(self.maneuvers)} maneuvers to "
+                             f"{MANEUVER_FILE}\n")
+
+    def _mv_revert(self) -> None:
+        self.maneuvers = load_maneuvers()
+        self._mv_refresh_list(select=0)
+        self._append_console("[maneuver] reverted to the saved test card\n")
+
+    # ----- Maneuvers tab: run controls ------------------------------------- #
+    def _mv_arm(self, on: bool) -> None:
+        if not getattr(self, "_worker_running", False):
+            if on:
+                self._append_console("[maneuver] connect before arming the injector\n")
+                self.mv_arm_chk.setChecked(False)
+            return
+        self.worker.post("inject_arm", bool(on))
+
+    def _mv_fire(self) -> None:
+        if not getattr(self, "_worker_running", False):
+            self._append_console("[maneuver] not connected\n")
+            return
+        self.worker.post("inject_fire", None)
+
+    def _mv_abort(self) -> None:
+        if getattr(self, "_worker_running", False):
+            self.worker.post("inject_abort", None)
+
+    def _on_injector_state(self, st: object) -> None:
+        """Mirror worker-side injector state into the tab. The worker is the
+        authority: it arms/disarms on its own (failsafe, controller latch), so
+        the checkbox follows it rather than the other way round."""
+        if not isinstance(st, dict):
+            return
+        armed = bool(st.get("armed"))
+        if armed != self.mv_arm_chk.isChecked():
+            self.mv_arm_chk.blockSignals(True)
+            self.mv_arm_chk.setChecked(armed)
+            self.mv_arm_chk.blockSignals(False)
+        idx = int(st.get("selected_index", -1))
+        if 0 <= idx < self.mv_list.count() and idx != self.mv_list.currentRow():
+            # Advance mode moves the selection on the worker side.
+            self.mv_list.setCurrentRow(idx)
+        if st.get("active"):
+            text = f"INJECTING: {st.get('running', '')}"
+            colour = "#b35c00"
+        elif armed:
+            text = f"Armed — next: {st.get('selected', '(none)')}"
+            colour = "#006400"
+        else:
+            text = "Injector: disarmed"
+            colour = "#555"
+        if st.get("saturated"):
+            text += "  [rate-limited: do not fit this pass]"
+        self.mv_status.setText(text)
+        self.mv_status.setStyleSheet(f"font-weight: bold; color: {colour};")
 
     def _build_override_tab(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -4499,10 +5703,28 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.throttle_slider, self.autonomous_chk,
                     self.override_chk, self.override_ctrl_chk,
                     self.trim_save_btn, self.surface_map_save_btn,
+                    # Injector RUN controls only. Editing the test card stays
+                    # live offline, which is the whole point of having it in the
+                    # GUI -- you build the card at the desk, not at the field.
+                    self.mv_arm_chk, self.mv_fire_btn, self.mv_abort_btn,
                     *self.trim_sliders.values(), *self.trim_spins.values(),
                     *self.surface_combos.values(),
                     *self.surface_invert_chks.values()):
             wdg.setEnabled(ok)
+        if ok:
+            # Hand the fresh worker the current card and run options: it starts
+            # from the file-backed library, which may be several edits behind.
+            self._mv_push()
+            self.worker.post("inject_advance", self.mv_advance_chk.isChecked())
+            self.worker.post("inject_stick_abort", self.mv_stick_abort_chk.isChecked())
+        else:
+            # A new session must start disarmed, no matter how the last one ended.
+            self.mv_arm_chk.blockSignals(True)
+            self.mv_arm_chk.setChecked(False)
+            self.mv_arm_chk.blockSignals(False)
+            self._on_injector_state({"armed": False, "active": False,
+                                     "selected_index": -1, "selected": "",
+                                     "running": "", "saturated": False})
 
     def closeEvent(self, event) -> None:
         self._save_notes()
