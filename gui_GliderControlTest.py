@@ -261,6 +261,28 @@ def clipped_day_dir(session_name: str) -> str:
 CONNECTION_WATCHDOG_TIMEOUT_S = 3.0
 DEFAULT_PLOT_WINDOW_S = 20.0  # how much history each live plot shows
 
+# Re-create the log blocks if NO log packet of any kind has arrived for this long.
+#
+# The deck tears its own logging down behind our back. In the firmware's log task
+# (modules/src/log.c) every block tick checks crtpIsConnected() and, if it is
+# false, calls logReset() -- which stops AND DELETES every log block and frees
+# all log ops. For the radio that check is just
+#   (now - lastPacketTick) < RADIO_ACTIVITY_TIMEOUT_MS
+# and the timeout is 1000 ms (hal/src/radiolink.c). So ONE second in which the
+# deck receives nothing destroys all logging, and the host is never told: cflib's
+# LogConfig objects still report added == started == True, so nothing retries.
+# Setpoints keep working because the commander port does not care about log
+# state, which is why the symptom is "live plots frozen forever but the aircraft
+# still flies" and why it takes a reconnect to clear.
+#
+# Must stay well above the fastest block period (10 ms here) but below
+# CONNECTION_WATCHDOG_TIMEOUT_S, so logging is back before the telemetry
+# watchdog mistakes a dead log block for a dead link and disarms.
+LOG_STALL_TIMEOUT_S = 2.0
+# Minimum spacing between recovery attempts, so a genuinely dead link produces a
+# slow retry rather than a CREATE_BLOCK burst every control-loop tick.
+LOG_RECOVERY_COOLDOWN_S = 2.0
+
 
 # --------------------------------------------------------------------------- #
 # PID / state dataclasses (carried over)
@@ -1564,6 +1586,15 @@ class GliderWorker(QtCore.QObject):
         # through the stored value. Keyed "trim:<axis>" / "pid:<axis>:<term>".
         self._knob_caught: Dict[str, bool] = {}
         self._knob_catch_sign: Dict[str, float] = {}
+        # ----- log block stall detection ---------------------------------- #
+        # Monotonic time of the last log packet of ANY block, stamped by the
+        # wrapper in _log_cb. 0.0 means logging has not been started yet, which
+        # must not count as a stall. Written on cflib's rx thread and read on the
+        # worker thread; a float rebind is atomic in CPython, so no lock.
+        self._last_log_rx_at = 0.0
+        self._log_recovery_at = 0.0
+        self._log_recovery_count = 0
+        self._log_cb_errors: Dict[str, float] = {}
         # ----- pid readback verification ---------------------------------- #
         # _pid_echo is written by _pid_echo_cb on cflib's rx thread and read by
         # _pid_verify_tick on the worker thread, hence the lock. _pid_verify is
@@ -2198,21 +2229,107 @@ class GliderWorker(QtCore.QObject):
             "accelerometer": self.config.log_accelerometer,
         }
 
+    def _log_cb(self, fn):
+        """Wrap a log data callback with arrival stamping and an exception guard.
+
+        The guard is not belt-and-braces. cflib's Caller.call() iterates its
+        callbacks with no per-callback try/except (utils/callbacks.py), so one
+        raising callback aborts the rest of the chain for that packet; the
+        exception surfaces in _IncomingPacketHandler, which reports it with
+        logger.error and drops the packet. This process never configures
+        logging, so such a traceback goes to stderr only and is invisible in the
+        GUI's log pane -- telemetry would appear to half-die for no stated
+        reason. Catching here keeps one bad block from taking the others down and
+        puts the reason somewhere the pilot will actually see it.
+
+        Stamping happens BEFORE the body, so a callback that raises every time
+        still counts as "log data is arriving" and does not trigger the block
+        recovery below -- re-creating the block would not fix a host-side bug.
+        """
+        name = getattr(fn, "__name__", "log_cb")
+
+        def wrapped(timestamp, data, logconf):
+            self._last_log_rx_at = time.monotonic()
+            try:
+                fn(timestamp, data, logconf)
+            except Exception as exc:
+                # Rate-limited: at 10 ms periods an unguarded report would flood
+                # the pane faster than it could be read.
+                now = time.monotonic()
+                if now - self._log_cb_errors.get(name, 0.0) > 5.0:
+                    self._log_cb_errors[name] = now
+                    self._log(f"[log] {name} raised: {exc!r} (further reports "
+                              "from this callback suppressed for 5s)\n")
+
+        return wrapped
+
     def _bind_log_callbacks(self) -> None:
-        self.cf.log.add_config(self.log_configs["controller"])
-        self.log_configs["controller"].data_received_cb.add_callback(self._on_controller_log)
-        self.cf.log.add_config(self.log_configs["motor"])
-        self.log_configs["motor"].data_received_cb.add_callback(self._on_motor_log)
-        self.cf.log.add_config(self.log_configs["connection"])
-        self.log_configs["connection"].data_received_cb.add_callback(self._on_connection_log)
-        self.cf.log.add_config(self.log_configs["accelerometer"])
-        self.log_configs["accelerometer"].data_received_cb.add_callback(self._on_accel_log)
+        for key, handler in (("controller", self._on_controller_log),
+                             ("motor", self._on_motor_log),
+                             ("connection", self._on_connection_log),
+                             ("accelerometer", self._on_accel_log)):
+            self.cf.log.add_config(self.log_configs[key])
+            self.log_configs[key].data_received_cb.add_callback(self._log_cb(handler))
 
     def _start_enabled_logs(self) -> None:
         for key, enabled in self.log_enabled.items():
             if enabled:
                 self.log_configs[key].start()
         time.sleep(0.1)
+        # Start the stall clock only now, so the time spent connecting and
+        # fetching the TOC is not mistaken for a stall on the first tick.
+        self._last_log_rx_at = time.monotonic()
+
+    def _log_recovery_tick(self) -> None:
+        """Re-create the deck's log blocks if log data has stopped arriving.
+
+        See LOG_STALL_TIMEOUT_S for why the deck silently deletes them. Recovery
+        has to force added = False before calling start(): cflib's start() only
+        sends CREATE_BLOCK when it believes the block is absent, and otherwise
+        sends START_LOGGING for an id the firmware no longer has. The deck's
+        CREATE_BLOCK reply is what then re-sends START_LOGGING, and that handler
+        is itself gated on `if not block.added` (crazyflie/log.py), so leaving
+        the stale True in place means nothing restarts.
+
+        add_config() is deliberately NOT called again: it re-resolves
+        default_fetch_as and would append every variable to the config a second
+        time. The existing LogConfig objects are reused as-is.
+
+        Correct whether or not the deck actually dropped the blocks: if they
+        still exist, CREATE_BLOCK returns EEXIST, which cflib treats as success
+        and follows with START_LOGGING anyway.
+        """
+        if self._last_log_rx_at == 0.0 or self.cf is None:
+            return
+        if not any(self.log_enabled.values()):
+            return
+        now = time.monotonic()
+        if (now - self._last_log_rx_at) <= LOG_STALL_TIMEOUT_S:
+            return
+        if self._log_recovery_at and (now - self._log_recovery_at) < LOG_RECOVERY_COOLDOWN_S:
+            return
+        self._log_recovery_at = now
+        self._log_recovery_count += 1
+        restarted = []
+        for key, enabled in self.log_enabled.items():
+            if not enabled:
+                continue
+            conf = self.log_configs[key]
+            try:
+                conf.started = False
+                conf.added = False
+                conf.start()
+                restarted.append(key)
+            except Exception as exc:
+                self._log(f"[log] could not restart the {key} block: {exc}\n")
+        if restarted:
+            self._log(f"[log] no log data for {LOG_STALL_TIMEOUT_S:.1f}s -- "
+                      f"re-creating blocks: {', '.join(restarted)} "
+                      f"(attempt {self._log_recovery_count})\n")
+            if self.logs is not None:
+                self.logs.write_event("LOG_BLOCKS_RESTARTED",
+                                      ",".join(restarted),
+                                      self._log_recovery_count)
 
     # ----- log callbacks (run on cflib threads) ---------------------------- #
     def _on_controller_log(self, timestamp, data, _logconf):
@@ -2348,6 +2465,7 @@ class GliderWorker(QtCore.QObject):
 
             self._drain_commands()
             self._pid_verify_tick()
+            self._log_recovery_tick()
             self._emit_button_state()
             self._emit_axes_state()
 
@@ -2493,6 +2611,8 @@ class GliderWorker(QtCore.QObject):
         elif action == "breakpoint":
             self.logs.write_breakpoint(str(payload) if payload else "MANUAL_BREAKPOINT")
             self._log("Breakpoint written.\n")
+        elif action == "persist_pid":
+            self._persist_pid_gains()
         elif action == "apply_pid":
             self.config.gains = payload
             self._apply_pid_gains(payload)
@@ -3189,19 +3309,32 @@ class GliderWorker(QtCore.QObject):
         """Persist the currently-tuned values to the deck's flash. In PID mode
         the selected axis' rate gains are stored; otherwise the surface trims."""
         if self._pid_mode:
-            axis = self._pid_axis
+            self._persist_pid_gains(self._pid_axis)
+        else:
+            self._persist_trim()
 
-            def _done(name, success):
-                self._log(f"PID {'saved' if success else 'SAVE FAILED'} ({name}).\n")
-            for term in ("kp", "ki", "kd"):
-                param = f"pid_rate.{axis}_{term}"
+    def _persist_pid_gains(self, axis: Optional[str] = None) -> None:
+        """Save rate gains to the deck's flash, one axis or all three.
+
+        Iterates PID_TERMS, which includes kff. This used to be a hardcoded
+        ("kp", "ki", "kd") and kff therefore reached flash by no path at all --
+        the knobs cannot tune it (see _pid_term_range, three physical pots) and
+        nothing else called persistent_store for it. A power cycle left the deck
+        holding knob-tuned kp/ki/kd next to a kff of 0.0 from the compiled
+        defaults, which is a feed-forward term silently switched off.
+        """
+        axes = PID_AXES if axis is None else (axis,)
+
+        def _done(name, success):
+            self._log(f"PID {'saved' if success else 'SAVE FAILED'} ({name}).\n")
+        for ax in axes:
+            for term in PID_TERMS:
+                param = f"pid_rate.{ax}_{term}"
                 try:
                     self.cf.param.persistent_store(param, _done)
                 except Exception as exc:
                     self._log(f"PID persist error ({param}): {exc}\n")
-            self.logs.write_event("PID_PERSIST_REQUEST", axis)
-        else:
-            self._persist_trim()
+        self.logs.write_event("PID_PERSIST_REQUEST", "all" if axis is None else axis)
 
     def _handle_controller_flight(self, live: LiveControl) -> None:
         """Continuous stick-driven flight: throttle + rate setpoints. Discrete
@@ -3815,6 +3948,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "to the deck on Connect.")
         save_pid_btn.clicked.connect(self._save_pid_defaults)
         grid.addWidget(save_pid_btn, 5, 0, 1, 5)
+        persist_pid_btn = QtWidgets.QPushButton("Save to deck flash")
+        persist_pid_btn.setToolTip(
+            "Store the gains the deck is currently running in its own flash "
+            "(PARAM_PERSISTENT), so they survive a power cycle.\n"
+            "Saves what the deck HAS, not what these boxes show -- press Apply PID "
+            "first if you have edited them.\n"
+            "Covers all three axes and all four terms including KFF, which "
+            "previously could not be saved to flash by any route.")
+        persist_pid_btn.clicked.connect(lambda: self.worker.post("persist_pid", None))
+        grid.addWidget(persist_pid_btn, 6, 0, 1, 5)
         layout.addWidget(pid_box)
 
         # Per-surface servo trims: the center each control surface actuates
