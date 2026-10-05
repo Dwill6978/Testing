@@ -282,6 +282,12 @@ class PidGains:
 
 PID_AXES = ("pitch", "yaw", "roll")
 PID_TERMS = ("kp", "ki", "kd", "kff")
+# How long to wait for the deck to echo the twelve pid_rate writes before giving
+# up and logging the readback as incomplete. Generous on purpose: cflib acks
+# param writes one at a time, so twelve queued writes behind a busy or lossy link
+# can legitimately take a while, and a false "no readback" warning is the exact
+# noise this verification was added to remove.
+PID_VERIFY_TIMEOUT_S = 3.0
 
 
 def load_default_gains() -> PidGains:
@@ -1558,6 +1564,13 @@ class GliderWorker(QtCore.QObject):
         # through the stored value. Keyed "trim:<axis>" / "pid:<axis>:<term>".
         self._knob_caught: Dict[str, bool] = {}
         self._knob_catch_sign: Dict[str, float] = {}
+        # ----- pid readback verification ---------------------------------- #
+        # _pid_echo is written by _pid_echo_cb on cflib's rx thread and read by
+        # _pid_verify_tick on the worker thread, hence the lock. _pid_verify is
+        # (expected_values, deadline) while an apply is outstanding, else None.
+        self._pid_echo: Dict[str, float] = {}
+        self._pid_echo_lock = threading.Lock()
+        self._pid_verify: Optional[Tuple[Dict[str, float], float]] = None
         # ----- maneuver injection ----------------------------------------- #
         # Propulsion throttle route for normal flight: True = streamed
         # meta-command (fast, needs the modded firmware), False = servo.servoAngle
@@ -1919,6 +1932,7 @@ class GliderWorker(QtCore.QObject):
         return 0.0
 
     def _configure_flight_controller(self) -> None:
+        self._bind_pid_echo_callback()
         self.cf.param.set_value("motorPowerSet.enable", "0")
         self.cf.param.set_value("flightmode.stabModeRoll", "0")
         self.cf.param.set_value("flightmode.stabModePitch", "0")
@@ -2003,48 +2017,123 @@ class GliderWorker(QtCore.QObject):
         self.logs.write_event("SURFACE_MAP_APPLIED",
                               " ".join(parts[:2]), *parts[2:4])
 
+    # WHY THE PID READBACK IS ASYNCHRONOUS
+    #
+    # cflib's param.set_value() does NOT block: it packs a packet and hands it to
+    # _ParamUpdater's queue, which drains on its own thread one request at a time
+    # (param.py:367). param.get_value() does NOT hit the radio at all: it is a
+    # plain dict read of the locally cached TOC values (param.py:381), refreshed
+    # only when the deck's echo arrives in _param_updated (param.py:215).
+    #
+    # So reading back immediately after writing reads the cache as it was BEFORE
+    # the writes -- 12 round trips still queued. The comparison then always fails
+    # and the warning always fires, which is exactly the "mismatch on first
+    # connection and on every gain change" symptom. The warning was crying wolf;
+    # the gains were landing fine.
+    #
+    # The fix cannot simply block until the echoes arrive, because _apply_pid_gains
+    # is reachable from _handle_command, which is drained INSIDE the 100 Hz control
+    # loop (_control_loop -> _drain_commands). Waiting there for 12 radio round
+    # trips would stall the setpoint stream for long enough to trip the firmware's
+    # commander timeout -- turning a cosmetic log bug into an in-flight failsafe.
+    #
+    # Instead: write, then arm a pending-verification record and let the deck's
+    # own echoes satisfy it. _pid_echo is filled by a pid_rate group callback on
+    # cflib's rx thread; _pid_verify_tick (called from the control loop) does the
+    # comparison and the logging, so self.logs stays owned by one thread.
+    def _bind_pid_echo_callback(self) -> None:
+        self.cf.param.add_update_callback(group="pid_rate", cb=self._pid_echo_cb)
+
+    def _pid_echo_cb(self, complete_name: str, value: str) -> None:
+        # Runs on cflib's incoming-packet thread: touch nothing but the dict.
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return
+        with self._pid_echo_lock:
+            self._pid_echo[complete_name] = parsed
+
     def _apply_pid_gains(self, gains: PidGains) -> None:
-        self.cf.param.set_value("pid_rate.pitch_kp", gains.pitch.kp)
-        self.cf.param.set_value("pid_rate.pitch_ki", gains.pitch.ki)
-        self.cf.param.set_value("pid_rate.pitch_kd", gains.pitch.kd)
-        self.cf.param.set_value("pid_rate.pitch_kff", gains.pitch.kff)
-        self.cf.param.set_value("pid_rate.yaw_kp", gains.yaw.kp)
-        self.cf.param.set_value("pid_rate.yaw_ki", gains.yaw.ki)
-        self.cf.param.set_value("pid_rate.yaw_kd", gains.yaw.kd)
-        self.cf.param.set_value("pid_rate.yaw_kff", gains.yaw.kff)
-        self.cf.param.set_value("pid_rate.roll_kp", gains.roll.kp)
-        self.cf.param.set_value("pid_rate.roll_ki", gains.roll.ki)
-        self.cf.param.set_value("pid_rate.roll_kd", gains.roll.kd)
-        self.cf.param.set_value("pid_rate.roll_kff", gains.roll.kff)
-        # Read back rather than trusting the writes, for the same reason as
-        # fwActLpf below: pid_rate.* are PARAM_PERSISTENT, so a set that fails
-        # leaves the previously STORED gains in force and the aircraft quietly
-        # flies the old tune. PID_APPLIED is the record every clipped flight is
-        # annotated with (clip_flights.CARRY_FORWARD_EVENTS), and a log that
-        # confidently states the wrong gains is worse than one that states none --
-        # it would send a tuning session chasing a change that never took.
-        readback = {}
+        # Verify against the deck's echo rather than trusting the writes:
+        # pid_rate.* are PARAM_PERSISTENT, so a set that fails leaves the
+        # previously STORED gains in force and the aircraft quietly flies the old
+        # tune. PID_APPLIED is the record every clipped flight is annotated with
+        # (clip_flights.CARRY_FORWARD_EVENTS), and a log that confidently states
+        # the wrong gains is worse than one that states none -- it would send a
+        # tuning session chasing a change that never took.
+        #
+        # Expected values are quantized to binary32 first. The deck stores each
+        # gain as a C float and echoes that back, so a requested 0.0035 (a float64
+        # here) comes home as 0.0035000001080334187. Comparing the raw request
+        # would report a "mismatch" on any gain not exactly representable in
+        # single precision -- true of most ki/kd values, though not of the current
+        # all-integer tune, which is why this has not bitten yet. Quantizing makes
+        # the comparison exact in both directions with no epsilon to tune:
+        # cflib caches str(float) and Python's float repr round-trips exactly.
+        expected = {}
         for axis in PID_AXES:
             for term in PID_TERMS:
-                param = f"pid_rate.{axis}_{term}"
-                try:
-                    readback[(axis, term)] = float(self.cf.param.get_value(param))
-                except Exception as exc:
-                    self._log(f"[pid] could not read back {param}: {exc}\n")
-                    readback[(axis, term)] = float("nan")
+                want = float(getattr(getattr(gains, axis), term))
+                expected[f"pid_rate.{axis}_{term}"] = struct.unpack(
+                    "<f", struct.pack("<f", want))[0]
+        # Clear the stale echoes BEFORE writing, not after. The initial TOC
+        # download leaves an echo cached for every param, and those pre-write
+        # values would satisfy the check instantly and verify nothing. Clearing
+        # after the writes would be worse still: it could discard a genuine echo
+        # that had already come home, and then the run could only ever time out.
+        with self._pid_echo_lock:
+            for name in expected:
+                self._pid_echo.pop(name, None)
+        self._pid_verify = (expected, time.monotonic() + PID_VERIFY_TIMEOUT_S)
+        for name in expected:
+            axis, term = name.split(".", 1)[1].rsplit("_", 1)
+            self.cf.param.set_value(name, getattr(getattr(gains, axis), term))
+        self._log("PID gains sent; awaiting readback.\n")
+
+    def _pid_verify_tick(self) -> None:
+        """Finish the PID readback once the deck has echoed the writes.
+
+        Called every control-loop tick; a dict identity check and a length
+        compare when idle, so it costs nothing. Emits PID_APPLIED either when all
+        twelve echoes are in or when the deadline expires -- a timeout still
+        writes the record, with the un-echoed terms marked nan, because silence
+        about the gains is the one outcome the analysis layer cannot work with.
+        """
+        if self._pid_verify is None:
+            return
+        expected, deadline = self._pid_verify
+        with self._pid_echo_lock:
+            got = {name: self._pid_echo.get(name) for name in expected}
+        missing = [name for name, value in got.items() if value is None]
+        timed_out = time.monotonic() > deadline
+        if missing and not timed_out:
+            return
+        self._pid_verify = None
+
+        def shown(name: str) -> float:
+            value = got[name]
+            return float("nan") if value is None else value
+
         # Terms are labelled so a log stays readable next to older sessions,
         # which recorded a bare (kp,ki,kd) triple and no feed-forward term.
         self.logs.write_event(
             "PID_APPLIED",
-            *(f"{axis}(" + ",".join(f"{t}={readback[(axis, t)]}" for t in PID_TERMS) + ")"
+            *(f"{axis}(" + ",".join(f"{t}={shown(f'pid_rate.{axis}_{t}')}"
+                                    for t in PID_TERMS) + ")"
               for axis in PID_AXES),
         )
-        mismatched = [f"{axis}_{term}" for axis in PID_AXES for term in PID_TERMS
-                      if readback[(axis, term)] != getattr(getattr(gains, axis), term)]
+        if missing:
+            self._log("[pid] WARNING: no readback within "
+                      f"{PID_VERIFY_TIMEOUT_S:.1f}s for: "
+                      f"{', '.join(n.split('.', 1)[1] for n in missing)}\n")
+        mismatched = [name for name, want in expected.items()
+                      if got[name] is not None and got[name] != want]
         if mismatched:
             self._log("[pid] WARNING: the deck reports different gains than were "
-                      f"requested for: {', '.join(mismatched)}\n")
-        self._log("PID gains applied.\n")
+                      "requested for: "
+                      f"{', '.join(n.split('.', 1)[1] for n in mismatched)}\n")
+        if not missing and not mismatched:
+            self._log("PID gains applied and confirmed by the deck.\n")
 
     def _create_log_configs(self) -> None:
         lg_controller = LogConfig(name="Controller", period_in_ms=self.config.period_controller_ms)
@@ -2258,6 +2347,7 @@ class GliderWorker(QtCore.QObject):
                 pygame.event.get()
 
             self._drain_commands()
+            self._pid_verify_tick()
             self._emit_button_state()
             self._emit_axes_state()
 
