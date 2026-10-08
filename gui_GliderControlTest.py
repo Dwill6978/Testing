@@ -849,10 +849,15 @@ CONTROLLER_PROFILES = {"xbox": XBOX_PROFILE, "rc": RC_PROFILE}
 # --------------------------------------------------------------------------- #
 # User-editable button maps (Mapping tab)
 # --------------------------------------------------------------------------- #
-# Every command the control loop actually reads, in display order. "latch" means
-# the handler mirrors the switch *position* (_latch_edge), so the action follows
-# the switch rather than toggling on each press; "edge" fires once per 0->1
-# transition (_edge_cmd).
+# Every command the control loop actually reads, in display order. Three kinds:
+#   "latch"  the handler mirrors the switch *position* (_latch_edge), so the
+#            action follows the switch rather than toggling on each press. Only
+#            correct for an input that physically holds its position.
+#   "edge"   fires once per 0->1 transition (_edge_cmd).
+#   "toggle" fires on the 0->1 transition and flips a state the app owns, so a
+#            momentary button behaves like a switch. Use this, not "latch", for
+#            anything bound to a spring-return button: a latch read of a
+#            momentary button turns the state off again on release.
 #
 # XBOX_PROFILE also carries "arm"/"disarm" entries, but nothing in
 # _poll_controller_buttons reads them -- arming is driven solely by the
@@ -876,7 +881,7 @@ CONTROLLER_COMMANDS: List[Tuple[str, str, str]] = [
     # Maneuver injection. Deliberately absent from both built-in profiles, so
     # they arrive UNMAPPED and have to be bound on the Mapping tab before any
     # button can fire a maneuver -- the logic ships inert.
-    ("inject_arm",    "Maneuver injector arm / disarm", "latch"),
+    ("inject_arm",    "Maneuver injector arm / disarm", "toggle"),
     ("inject_fire",   "Fire the selected maneuver",     "edge"),
     ("inject_abort",  "Abort maneuver injection",       "edge"),
 ]
@@ -3151,9 +3156,16 @@ class GliderWorker(QtCore.QObject):
         # Routed through _handle_command rather than touching the injector
         # directly, so a controller button and the tab's buttons take exactly
         # the same path -- including the gate checks and the logging.
-        inj_changed, inj_level = self._latch_edge("inject_arm")
-        if inj_changed and inj_level is not None:
-            self._handle_command("inject_arm", inj_level)
+        # Arm is a TOGGLE, not a latch: it flips the injector's own armed state
+        # on each press and ignores the release. Read as a latch it tracked the
+        # button level, so the injector was armed only while the button was held
+        # -- unflyable, because firing and working the sticks needs that hand.
+        # The flip is computed from self.injector.armed rather than from a local
+        # copy, so the GUI checkbox, this button and a failsafe disarm all share
+        # one source of truth and the next press is always a real inversion of
+        # what the aircraft is actually doing.
+        if self._edge_cmd("inject_arm"):
+            self._handle_command("inject_arm", not self.injector.armed)
         if self._edge_cmd("inject_fire"):
             self._handle_command("inject_fire", None)
         if self._edge_cmd("inject_abort"):
@@ -4661,11 +4673,15 @@ class MainWindow(QtWidgets.QMainWindow):
         for row, (cmd, label, kind) in enumerate(CONTROLLER_COMMANDS):
             self.map_cmd_table.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
             kind_item = QtWidgets.QTableWidgetItem(
-                "switch" if kind == "latch" else "press")
-            kind_item.setToolTip(
-                "switch: the action follows the switch position (on while up)."
-                if kind == "latch" else
-                "press: the action fires once each time the button goes down.")
+                {"latch": "switch", "toggle": "toggle"}.get(kind, "press"))
+            kind_item.setToolTip({
+                "latch": "switch: the action follows the switch position "
+                         "(on while up). Bind a switch, not a button -- a "
+                         "momentary button would turn it off on release.",
+                "toggle": "toggle: each press flips the state and the release "
+                          "is ignored, so a momentary button acts as a switch.",
+            }.get(kind,
+                  "press: the action fires once each time the button goes down."))
             self.map_cmd_table.setItem(row, 1, kind_item)
             combo = QtWidgets.QComboBox()
             # Bind cmd by default arg: a bare closure over the loop variable would
